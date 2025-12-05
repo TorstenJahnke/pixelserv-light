@@ -35,5 +35,8 @@ config.status
 stamp-h1
 .deps/
 
-# Built binary
+# Built binaries
 pixelserv-tls
+pixelserv-tls-test
+analyze.log
+build/
