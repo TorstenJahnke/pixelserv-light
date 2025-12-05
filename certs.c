@@ -631,12 +631,27 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
     if(pem_fn[0] == '_') pem_fn[0] = '*';
 
     // -- generate key based on cert_key_type
-    // 0=RSA2048, 1=RSA4096, 2=ECDSA-P256, 3=ECDSA-P384, 4=RSA8192, 5=RSA16384
+    // 0=RSA2048, 1=RSA3072, 2=RSA4096, 3=RSA8192, 4=RSA16384, 5=ECDSA-P256, 6=ECDSA-P384, 7=SM2
     BIGNUM *e = BN_new();
     BN_set_word(e, RSA_F4);
 
     switch (cert_key_type) {
-    case 1: // RSA 4096
+    case 0: // RSA 2048
+#if OPENSSL_VERSION_MAJOR >= 3
+        key = EVP_RSA_gen(2048);
+#else
+        {
+            RSA *rsa = RSA_new();
+            if (RSA_generate_key_ex(rsa, 2048, e, NULL) < 0) {
+                RSA_free(rsa);
+                goto free_all;
+            }
+            key = EVP_PKEY_new();
+            EVP_PKEY_assign_RSA(key, rsa);
+        }
+#endif
+        break;
+    case 2: // RSA 4096
 #if OPENSSL_VERSION_MAJOR >= 3
         key = EVP_RSA_gen(4096);
 #else
@@ -651,37 +666,7 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
         }
 #endif
         break;
-    case 2: // ECDSA P-256
-#if OPENSSL_VERSION_MAJOR >= 3
-        key = EVP_EC_gen("P-256");
-#else
-        {
-            EC_KEY *ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
-            if (!ec || !EC_KEY_generate_key(ec)) {
-                if (ec) EC_KEY_free(ec);
-                goto free_all;
-            }
-            key = EVP_PKEY_new();
-            EVP_PKEY_assign_EC_KEY(key, ec);
-        }
-#endif
-        break;
-    case 3: // ECDSA P-384
-#if OPENSSL_VERSION_MAJOR >= 3
-        key = EVP_EC_gen("P-384");
-#else
-        {
-            EC_KEY *ec = EC_KEY_new_by_curve_name(NID_secp384r1);
-            if (!ec || !EC_KEY_generate_key(ec)) {
-                if (ec) EC_KEY_free(ec);
-                goto free_all;
-            }
-            key = EVP_PKEY_new();
-            EVP_PKEY_assign_EC_KEY(key, ec);
-        }
-#endif
-        break;
-    case 4: // RSA 8192
+    case 3: // RSA 8192
 #if OPENSSL_VERSION_MAJOR >= 3
         key = EVP_RSA_gen(8192);
 #else
@@ -696,7 +681,7 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
         }
 #endif
         break;
-    case 5: // RSA 16384
+    case 4: // RSA 16384
 #if OPENSSL_VERSION_MAJOR >= 3
         key = EVP_RSA_gen(16384);
 #else
@@ -711,14 +696,61 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
         }
 #endif
         break;
-    case 0: // RSA 2048 (default)
+    case 5: // ECDSA P-256
+#if OPENSSL_VERSION_MAJOR >= 3
+        key = EVP_EC_gen("P-256");
+#else
+        {
+            EC_KEY *ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+            if (!ec || !EC_KEY_generate_key(ec)) {
+                if (ec) EC_KEY_free(ec);
+                goto free_all;
+            }
+            key = EVP_PKEY_new();
+            EVP_PKEY_assign_EC_KEY(key, ec);
+        }
+#endif
+        break;
+    case 6: // ECDSA P-384
+#if OPENSSL_VERSION_MAJOR >= 3
+        key = EVP_EC_gen("P-384");
+#else
+        {
+            EC_KEY *ec = EC_KEY_new_by_curve_name(NID_secp384r1);
+            if (!ec || !EC_KEY_generate_key(ec)) {
+                if (ec) EC_KEY_free(ec);
+                goto free_all;
+            }
+            key = EVP_PKEY_new();
+            EVP_PKEY_assign_EC_KEY(key, ec);
+        }
+#endif
+        break;
+#ifdef HAVE_SM2
+    case 7: // SM2 (Tongsuo only)
+#if OPENSSL_VERSION_MAJOR >= 3
+        key = EVP_EC_gen("SM2");
+#else
+        {
+            EC_KEY *ec = EC_KEY_new_by_curve_name(NID_sm2);
+            if (!ec || !EC_KEY_generate_key(ec)) {
+                if (ec) EC_KEY_free(ec);
+                goto free_all;
+            }
+            key = EVP_PKEY_new();
+            EVP_PKEY_assign_EC_KEY(key, ec);
+        }
+#endif
+        break;
+#endif
+    case 1: // RSA 3072 (default)
     default:
 #if OPENSSL_VERSION_MAJOR >= 3
-        key = EVP_RSA_gen(2048);
+        key = EVP_RSA_gen(3072);
 #else
         {
             RSA *rsa = RSA_new();
-            if (RSA_generate_key_ex(rsa, 2048, e, NULL) < 0) {
+            if (RSA_generate_key_ex(rsa, 3072, e, NULL) < 0) {
                 RSA_free(rsa);
                 goto free_all;
             }
@@ -1055,7 +1087,7 @@ typedef struct {
     char domain[PIXELSERV_MAX_SERVER_NAME + 1];
     time_t created;
     time_t expires;
-    int key_type;  /* 0=RSA2048, 1=RSA4096, 2=ECDSA-P256, 3=ECDSA-P384, 4=RSA8192, 5=RSA16384 */
+    int key_type;  /* 0=RSA2048, 1=RSA3072, 2=RSA4096, 3=RSA8192, 4=RSA16384, 5=ECDSA-P256, 6=ECDSA-P384, 7=SM2 */
 } cert_index_entry_t;
 
 /* Forward declarations for index functions */
