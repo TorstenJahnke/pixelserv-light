@@ -308,13 +308,22 @@ int main (int argc, char* argv[])
   } // for
 
   if (error) {
+    /* Get SSL library version string - Tongsuo reports as "OpenSSL x.y.z date"
+     * so we need to replace the prefix for proper identification */
+    const char *ssl_version_raw = OpenSSL_version(OPENSSL_VERSION);
+    char ssl_version_buf[128];
 #ifdef ENABLE_TONGCHOU
-    const char *ssl_lib_name = "Tongsuo";
+    /* Replace "OpenSSL" with "Tongsuo" in version string */
+    if (strncmp(ssl_version_raw, "OpenSSL ", 8) == 0) {
+        snprintf(ssl_version_buf, sizeof(ssl_version_buf), "Tongsuo %s", ssl_version_raw + 8);
+    } else {
+        snprintf(ssl_version_buf, sizeof(ssl_version_buf), "Tongsuo (%s)", ssl_version_raw);
+    }
 #else
-    const char *ssl_lib_name = "OpenSSL";
+    snprintf(ssl_version_buf, sizeof(ssl_version_buf), "%s", ssl_version_raw);
 #endif
     printf("pixelserv-tls %s (compiled: " __DATE__ " " __TIME__ FEATURE_FLAGS ")\n"
-           "SSL Library: %s (%s)\n"
+           "SSL Library: %s\n"
            "Usage: pixelserv-tls [OPTION]" "\n"
            "options:" "\n"
            "\t" "ip_addr/hostname\t(default: 0.0.0.0)" "\n"
@@ -356,7 +365,7 @@ int main (int argc, char* argv[])
            "\t" "-z  CERT_PATH\t\t(default: "
            DEFAULT_PEM_PATH
            ")" "\n"
-           , VERSION, ssl_lib_name, OpenSSL_version(OPENSSL_VERSION),
+           , VERSION, ssl_version_buf,
            DEFAULT_CERT_CACHE_SIZE, DEFAULT_CERT_VALIDITY_DAYS, DEFAULT_KEEPALIVE,
            DEFAULT_THREAD_MAX);
     exit(EXIT_FAILURE);
