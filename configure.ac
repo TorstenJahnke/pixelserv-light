@@ -1,4 +1,4 @@
-AC_INIT([pixelserv-tls], [2.5.0], [])
+AC_INIT([pixelserv-tls], [2.5.3], [])
 AM_INIT_AUTOMAKE([-Wall -Werror foreign])
 AC_CANONICAL_HOST
 AC_PROG_CC

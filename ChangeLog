@@ -1,4 +1,4 @@
-2025-12-05 v2.5.0 (Torsten Jahnke)
+2025-12-05 v2.5.3 (Torsten Jahnke)
 
 * NEW support for SM2/SM3/SM4 (Tongchou/国密) Chinese national cryptography ciphers
 * NEW BSI TR-02102-2 / NIS2 compliance mode with Brainpool curves and X448 support
