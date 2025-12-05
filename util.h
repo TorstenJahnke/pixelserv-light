@@ -23,7 +23,7 @@
 #include <openssl/ssl.h>
 
 // preprocessor defines
-#define VERSION "2.5.3"
+#define VERSION "2.5.6"
 
 /* Listen backlog - how many pending connections queue will hold
  * For 10M+ concurrent users, increase kernel limit:

@@ -1,4 +1,4 @@
-2025-12-05 v2.5.3 (Torsten Jahnke)
+2025-12-05 v2.5.6 (Torsten Jahnke)
 
 * NEW support for SM2/SM3/SM4 (Tongchou/国密) Chinese national cryptography ciphers
 * NEW BSI TR-02102-2 / NIS2 compliance mode with Brainpool curves and X448 support
@@ -27,10 +27,13 @@
   - Lock-free MPMC queue (8K capacity) for work distribution
   - Scales to 8-12 million concurrent users
   - Fallback to synchronous generation if queue full
-* PERFORMANCE enterprise-scale defaults:
+* PERFORMANCE enterprise-scale defaults for 10M+ concurrent users:
   - DEFAULT_CERT_CACHE_SIZE: 500 → 100,000 (use -c for millions)
   - DEFAULT_THREAD_MAX: 1,200 → 65,536 concurrent threads
   - Hash table: 200% capacity, min 1K slots, 50% warning threshold
+  - PIXEL_SSL_SESS_CACHE_SIZE: 2,560 → 1,048,576 (1M sessions)
+  - TCP_FASTOPEN_QLEN: 25 → 1,024 for high connection rates
+  - Kernel tuning documentation for SOMAXCONN, file descriptors
 * NEW sharded certificate index (pem_dir/index/) - scales to 5-10 million certificates
   - 256 shards (00.idx - ff.idx) based on FNV-1a hash
   - Lock-free parallel access to different shards
