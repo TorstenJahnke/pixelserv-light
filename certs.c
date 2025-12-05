@@ -16,6 +16,7 @@
 #include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
+#include <openssl/ec.h>
 #include <openssl/x509v3.h>
 
 #include "certs.h"
@@ -416,29 +417,87 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
 
     if(pem_fn[0] == '_') pem_fn[0] = '*';
 
-    // -- generate cert
+    // -- generate key based on cert_key_type
+    // 0=RSA2048, 1=RSA4096, 2=ECDSA-P256, 3=ECDSA-P384
     BIGNUM *e = BN_new();
     BN_set_word(e, RSA_F4);
+
+    switch (cert_key_type) {
+    case 1: // RSA 4096
 #if OPENSSL_VERSION_MAJOR >= 3
-    key = EVP_RSA_gen(2048);
+        key = EVP_RSA_gen(4096);
+#else
+        {
+            RSA *rsa = RSA_new();
+            if (RSA_generate_key_ex(rsa, 4096, e, NULL) < 0) {
+                RSA_free(rsa);
+                goto free_all;
+            }
+            key = EVP_PKEY_new();
+            EVP_PKEY_assign_RSA(key, rsa);
+        }
+#endif
+        break;
+    case 2: // ECDSA P-256
+#if OPENSSL_VERSION_MAJOR >= 3
+        key = EVP_EC_gen("P-256");
+#else
+        {
+            EC_KEY *ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+            if (!ec || !EC_KEY_generate_key(ec)) {
+                if (ec) EC_KEY_free(ec);
+                goto free_all;
+            }
+            key = EVP_PKEY_new();
+            EVP_PKEY_assign_EC_KEY(key, ec);
+        }
+#endif
+        break;
+    case 3: // ECDSA P-384
+#if OPENSSL_VERSION_MAJOR >= 3
+        key = EVP_EC_gen("P-384");
+#else
+        {
+            EC_KEY *ec = EC_KEY_new_by_curve_name(NID_secp384r1);
+            if (!ec || !EC_KEY_generate_key(ec)) {
+                if (ec) EC_KEY_free(ec);
+                goto free_all;
+            }
+            key = EVP_PKEY_new();
+            EVP_PKEY_assign_EC_KEY(key, ec);
+        }
+#endif
+        break;
+    case 0: // RSA 2048 (default)
+    default:
+#if OPENSSL_VERSION_MAJOR >= 3
+        key = EVP_RSA_gen(2048);
+#else
+        {
+            RSA *rsa = RSA_new();
+            if (RSA_generate_key_ex(rsa, 2048, e, NULL) < 0) {
+                RSA_free(rsa);
+                goto free_all;
+            }
+            key = EVP_PKEY_new();
+            EVP_PKEY_assign_RSA(key, rsa);
+        }
+#endif
+        break;
+    }
+
     if (!key)
         goto free_all;
-#else
-    RSA *rsa = RSA_new();
-    if (RSA_generate_key_ex(rsa, 2048, e, NULL) < 0)
-        goto free_all;
-    key = EVP_PKEY_new();
-    EVP_PKEY_assign_RSA(key, rsa); // rsa will be freed when key is freed
-#endif
+
 #ifdef DEBUG
-    printf("%s: rsa key generated for [%s]\n", __FUNCTION__, pem_fn);
+    printf("%s: key (type %d) generated for [%s]\n", __FUNCTION__, cert_key_type, pem_fn);
 #endif
     if((x509 = X509_new()) == NULL)
         goto free_all;
     ASN1_INTEGER_set(X509_get_serialNumber(x509),rand());
     X509_set_version(x509, 2); // X509 v3
     X509_gmtime_adj(X509_get_notBefore(x509), 0);
-    X509_gmtime_adj(X509_get_notAfter(x509), 3600*24*825L); // cert valid for 825 days
+    X509_gmtime_adj(X509_get_notAfter(x509), 3600*24*(long)cert_validity_days); // cert validity from config
     X509_set_issuer_name(x509, issuer);
     X509_NAME *name = X509_get_subject_name(x509);
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char *)pem_fn, -1, -1, 0);
@@ -473,8 +532,8 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
         log_msg(LGG_ERR, "%s: failed to open file for write: %s", __FUNCTION__, fname);
         goto free_all;
     }
-    PEM_write_X509(fp, x509);
     PEM_write_PrivateKey(fp, key, NULL, NULL, 0, NULL, NULL);
+    PEM_write_X509(fp, x509);
     fclose(fp);
     log_msg(LGG_NOTICE, "cert generated to disk: %s", pem_fn);
 
@@ -487,15 +546,32 @@ free_all:
 }
 
 
+/* Passphrase callback structure */
+typedef struct {
+    const char *pem_dir;
+    const char *key_name;  /* "rootca" or "subca" */
+} passwd_cb_arg_t;
+
 static int pem_passwd_cb(char *buf, int size, int rwflag, void *u) {
     int rv = 0, fp;
     char *fname = NULL;
-    if (asprintf(&fname, "%s/ca.key.passphrase", (char*)u) < 0)
+    passwd_cb_arg_t *arg = (passwd_cb_arg_t *)u;
+
+    if (asprintf(&fname, "%s/%s.key.passphrase", arg->pem_dir, arg->key_name) < 0)
         goto quit_cb;
 
-    if ((fp = open(fname, O_RDONLY)) < 0)
-        log_msg(LGG_ERR, "%s: failed to open ca.key.passphrase", __FUNCTION__);
-    else {
+    if ((fp = open(fname, O_RDONLY)) < 0) {
+        /* Try legacy ca.key.passphrase for backwards compatibility */
+        free(fname);
+        if (asprintf(&fname, "%s/ca.key.passphrase", arg->pem_dir) < 0)
+            goto quit_cb;
+        if ((fp = open(fname, O_RDONLY)) < 0)
+            log_msg(LGG_DEBUG, "%s: no passphrase file found", __FUNCTION__);
+        else {
+            rv = read(fp, buf, size);
+            close(fp);
+        }
+    } else {
         rv = read(fp, buf, size);
         close(fp);
 #ifdef DEBUG
@@ -506,65 +582,187 @@ static int pem_passwd_cb(char *buf, int size, int rwflag, void *u) {
 
 quit_cb:
     free(fname);
-    return --rv; // trim \n at the end
+    return (rv > 0) ? --rv : 0; // trim \n at the end
+}
+
+/* Helper to load a certificate file into a chain */
+static int load_cert_to_chain(STACK_OF(X509_INFO) **chain, const char *cert_path) {
+    FILE *fp = fopen(cert_path, "r");
+    if (!fp)
+        return 0;
+
+    BIO *bioin = BIO_new_fp(fp, BIO_CLOSE);
+    if (!bioin) {
+        fclose(fp);
+        return 0;
+    }
+
+    STACK_OF(X509_INFO) *certs = PEM_X509_INFO_read_bio(bioin, NULL, NULL, NULL);
+    BIO_free(bioin);
+
+    if (!certs)
+        return 0;
+
+    if (*chain == NULL) {
+        *chain = certs;
+    } else {
+        /* Append certs to existing chain */
+        int i;
+        for (i = 0; i < sk_X509_INFO_num(certs); i++) {
+            X509_INFO *inf = sk_X509_INFO_value(certs, i);
+            if (inf && inf->x509) {
+                X509_INFO *dup = X509_INFO_new();
+                if (dup) {
+                    dup->x509 = X509_dup(inf->x509);
+                    sk_X509_INFO_push(*chain, dup);
+                }
+            }
+        }
+        sk_X509_INFO_pop_free(certs, X509_INFO_free);
+    }
+    return 1;
 }
 
 void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
 {
     FILE *fp = NULL;
     char cert_file[PIXELSERV_MAX_PATH];
-    X509 *x509 = X509_new();
+    X509 *issuer_cert = NULL;
+    int use_subca = 0;
+    passwd_cb_arg_t passwd_arg;
 
     memset(ct, 0, sizeof(cert_tlstor_t));
-    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/ca.crt", pem_dir);
+    ct->pem_dir = pem_dir;
+    passwd_arg.pem_dir = pem_dir;
+
+    /*
+     * New CA hierarchy:
+     * - rootca.crt + rootca.key (required, at least one CA)
+     * - subca.crt + subca.key (optional, used for signing if present)
+     * - subca.cs.crt (optional, cross-signed certificate for chain)
+     *
+     * Fallback to legacy ca.crt + ca.key if new files not found
+     */
+
+    /* Try to load SubCA first (if exists, this is the signing CA) */
+    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/subca.crt", pem_dir);
     fp = fopen(cert_file, "r");
+    if (fp) {
+        issuer_cert = X509_new();
+        if (PEM_read_X509(fp, &issuer_cert, NULL, NULL)) {
+            log_msg(LGG_NOTICE, "Using SubCA for certificate signing");
+            use_subca = 1;
+        } else {
+            X509_free(issuer_cert);
+            issuer_cert = NULL;
+        }
+        fclose(fp);
+        fp = NULL;
+    }
 
-    if(!fp || !PEM_read_X509(fp, &x509, NULL, NULL)) {
-       log_msg(LGG_ERR, "%s: failed to load ca.crt", __FUNCTION__);
-       if (fp) fclose(fp);
-    } else {
-        char *cafile = NULL;
-        int fsz;
-        BIO *bioin;
-        EVP_PKEY *pubkey = X509_get_pubkey(x509);
-
-        if (fseek(fp, 0L, SEEK_END) < 0)
-            log_msg(LGG_ERR, "%s: failed to seek ca.crt", __FUNCTION__);
-
-        fsz = ftell(fp);
-        cafile = malloc(fsz);
-        if (!cafile) {
-            log_msg(LGG_ERR, "%s: failed to allocate memory for ca.crt", __FUNCTION__);
-            EVP_PKEY_free(pubkey);
+    /* If no SubCA, try RootCA */
+    if (!use_subca) {
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootca.crt", pem_dir);
+        fp = fopen(cert_file, "r");
+        if (fp) {
+            issuer_cert = X509_new();
+            if (PEM_read_X509(fp, &issuer_cert, NULL, NULL)) {
+                log_msg(LGG_NOTICE, "Using RootCA for certificate signing");
+            } else {
+                X509_free(issuer_cert);
+                issuer_cert = NULL;
+            }
             fclose(fp);
-            X509_free(x509);
+            fp = NULL;
+        }
+    }
+
+    /* Fallback to legacy ca.crt */
+    if (!issuer_cert) {
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/ca.crt", pem_dir);
+        fp = fopen(cert_file, "r");
+        if (fp) {
+            issuer_cert = X509_new();
+            if (PEM_read_X509(fp, &issuer_cert, NULL, NULL)) {
+                log_msg(LGG_NOTICE, "Using legacy ca.crt for certificate signing");
+            } else {
+                X509_free(issuer_cert);
+                issuer_cert = NULL;
+            }
+            fclose(fp);
+            fp = NULL;
+        }
+    }
+
+    if (!issuer_cert) {
+        log_msg(LGG_ERR, "%s: no CA certificate found (tried subca.crt, rootca.crt, ca.crt)", __FUNCTION__);
+        return;
+    }
+
+    ct->issuer = X509_NAME_dup(X509_get_subject_name(issuer_cert));
+    X509_free(issuer_cert);
+
+    /* Build CA chain: SubCA (or SubCA cross-signed) + RootCA */
+    if (use_subca) {
+        /* Try cross-signed SubCA first, fall back to regular SubCA */
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/subca.cs.crt", pem_dir);
+        if (!load_cert_to_chain(&ct->cachain, cert_file)) {
+            snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/subca.crt", pem_dir);
+            load_cert_to_chain(&ct->cachain, cert_file);
+        }
+        /* Add RootCA to chain */
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootca.crt", pem_dir);
+        load_cert_to_chain(&ct->cachain, cert_file);
+    } else {
+        /* Just RootCA or legacy ca.crt */
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootca.crt", pem_dir);
+        if (!load_cert_to_chain(&ct->cachain, cert_file)) {
+            snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/ca.crt", pem_dir);
+            load_cert_to_chain(&ct->cachain, cert_file);
+        }
+    }
+
+    if (ct->cachain == NULL)
+        log_msg(LGG_ERR, "%s: failed to build CA chain", __FUNCTION__);
+
+    /* Load private key - must match the signing certificate */
+    if (use_subca) {
+        /* SubCA mode: MUST have subca.key */
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/subca.key", pem_dir);
+        passwd_arg.key_name = "subca";
+        fp = fopen(cert_file, "r");
+        if (fp && PEM_read_PrivateKey(fp, &ct->privkey, pem_passwd_cb, &passwd_arg)) {
+            fclose(fp);
+            log_msg(LGG_NOTICE, "Loaded SubCA private key");
             return;
         }
-        fseek(fp, 0L, SEEK_SET);
-        fsz = fread(cafile, 1, fsz, fp);
-
-        bioin = BIO_new_mem_buf(cafile, fsz);
-        if (!bioin)
-            log_msg(LGG_ERR, "%s: failed to create BIO mem buffer", __FUNCTION__);
-
-        ct->pem_dir = pem_dir;
-        ct->cachain = PEM_X509_INFO_read_bio(bioin, NULL, NULL, NULL);
-        ct->issuer = X509_NAME_dup(X509_get_subject_name(x509));
-
-        if (ct->cachain == NULL)
-            log_msg(LGG_ERR, "%s: failed to read CA chains", __FUNCTION__);
-
-        BIO_free(bioin);
-        EVP_PKEY_free(pubkey);
-        free(cafile);
-        fclose(fp);
+        if (fp) fclose(fp);
+        log_msg(LGG_ERR, "%s: SubCA mode requires subca.key but it's missing or unreadable", __FUNCTION__);
+        /* Clear issuer since we can't sign anything */
+        X509_NAME_free(ct->issuer);
+        ct->issuer = NULL;
+        return;
     }
-    X509_free(x509);
 
-    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/ca.key", pem_dir);
+    /* RootCA mode: try rootca.key first */
+    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootca.key", pem_dir);
+    passwd_arg.key_name = "rootca";
     fp = fopen(cert_file, "r");
-    if(!fp || !PEM_read_PrivateKey(fp, &ct->privkey, pem_passwd_cb, (void*)pem_dir))
-        log_msg(LGG_ERR, "%s: failed to load ca.key", __FUNCTION__);
+    if (fp && PEM_read_PrivateKey(fp, &ct->privkey, pem_passwd_cb, &passwd_arg)) {
+        fclose(fp);
+        log_msg(LGG_NOTICE, "Loaded RootCA private key");
+        return;
+    }
+    if (fp) fclose(fp);
+
+    /* Fallback to legacy ca.key */
+    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/ca.key", pem_dir);
+    passwd_arg.key_name = "ca";
+    fp = fopen(cert_file, "r");
+    if (!fp || !PEM_read_PrivateKey(fp, &ct->privkey, pem_passwd_cb, &passwd_arg))
+        log_msg(LGG_ERR, "%s: failed to load any private key (tried rootca.key, ca.key)", __FUNCTION__);
+    else
+        log_msg(LGG_NOTICE, "Loaded private key from ca.key (legacy)");
     if (fp) fclose(fp);
 }
 
@@ -593,7 +791,7 @@ void *cert_generator(void *ptr) {
     for (;;) {
         int ret;
         if(fd == -1)
-            log_msg(LGG_ERR, "%s: failed to open %s: %s", PIXEL_CERT_PIPE, strerror(errno));
+            log_msg(LGG_ERR, "%s: failed to open %s: %s", __FUNCTION__, PIXEL_CERT_PIPE, strerror(errno));
         strcpy(buf, half_token);
         struct pollfd pfd = { fd, POLLIN, POLLIN };
         ret = poll(&pfd, 1, 1000 * PIXEL_SSL_SESS_TIMEOUT / 4);

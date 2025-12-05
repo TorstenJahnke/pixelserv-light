@@ -55,6 +55,10 @@ volatile sig_atomic_t v12 = 0;
 volatile sig_atomic_t v10 = 0;
 volatile sig_atomic_t zrt = 0;
 
+// Certificate configuration
+int cert_validity_days = DEFAULT_CERT_VALIDITY_DAYS;
+int cert_key_type = DEFAULT_CERT_KEY_TYPE;
+
 // private data
 static struct timespec startup_time = {0, 0};
 static clockid_t clock_source = CLOCK_MONOTONIC;

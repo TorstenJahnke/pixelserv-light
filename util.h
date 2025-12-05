@@ -36,6 +36,9 @@
 #define DEFAULT_THREAD_MAX 1200 // maximum number of concurrent service threads
 #define DEFAULT_CERT_CACHE_SIZE 500
                                 // default number of certificates to be cached in memory
+#define DEFAULT_CERT_VALIDITY_DAYS 100
+                                // default certificate validity in days
+#define DEFAULT_CERT_KEY_TYPE 0 // 0=RSA2048, 1=RSA4096, 2=ECDSA-P256, 3=ECDSA-P384
 #define SECOND_PORT "443"
 #define MAX_PORTS 10
 #define MAX_TLS_PORTS 9         // PLEASE ENSURE MAX_TLS_PORTS < MAX_PORTS
@@ -127,6 +130,10 @@ extern volatile sig_atomic_t v13;
 extern volatile sig_atomic_t v12;
 extern volatile sig_atomic_t v10;
 extern volatile sig_atomic_t zrt;
+
+// Certificate configuration
+extern int cert_validity_days;  // certificate validity in days
+extern int cert_key_type;       // 0=RSA2048, 1=RSA4096, 2=ECDSA-P256, 3=ECDSA-P384
 
 struct Global {
     int argc;
