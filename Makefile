@@ -89,7 +89,7 @@ LDFLAGS += -lpthread $(EXTRA_LDFLAGS)
 # =============================================================================
 # Build Targets
 # =============================================================================
-.PHONY: all clean install debug static static-ssl help info
+.PHONY: all clean install debug static static-ssl help info address thread analyze secure memcheck
 
 all: $(PROGNAME)
 
@@ -133,6 +133,51 @@ tongchou: all
 static-tongchou: CFLAGS += -DENABLE_TONGCHOU
 static-tongchou: LDFLAGS += -static
 static-tongchou: all
+
+# =============================================================================
+# Sanitizer and Analysis Targets
+# =============================================================================
+
+# AddressSanitizer - detect memory errors (buffer overflow, use-after-free, etc.)
+address:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="$(CFLAGS) -g -O1 -fsanitize=address -fno-omit-frame-pointer" \
+		LDFLAGS="$(LDFLAGS) -fsanitize=address" all
+	@echo "Built with AddressSanitizer - run binary to detect memory errors"
+
+# ThreadSanitizer - detect data races
+thread:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="$(CFLAGS) -g -O1 -fsanitize=thread -fno-omit-frame-pointer" \
+		LDFLAGS="$(LDFLAGS) -fsanitize=thread" all
+	@echo "Built with ThreadSanitizer - run binary to detect data races"
+
+# Static analysis with compiler warnings maxed out
+analyze:
+	$(MAKE) clean
+	@echo "=== Static Analysis ==="
+	$(MAKE) CFLAGS="$(CFLAGS) -g -O0 -fanalyzer -Wconversion -Wshadow -Wformat=2 \
+		-Wcast-qual -Wcast-align -Wlogical-op -Wmissing-declarations \
+		-Wredundant-decls -Wstrict-prototypes -Wold-style-definition" all 2>&1 | tee analyze.log
+	@echo "Analysis complete. See analyze.log for details."
+
+# Security-hardened build
+secure:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="$(CFLAGS) -g -O2 -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+		-fPIE -Wformat -Wformat-security" \
+		LDFLAGS="$(LDFLAGS) -pie -Wl,-z,relro,-z,now" all
+	@echo "Built with security hardening (FORTIFY_SOURCE, stack protector, PIE, RELRO)"
+
+# Valgrind memcheck wrapper
+memcheck: debug
+	@echo "=== Valgrind Memcheck ==="
+	@if command -v valgrind >/dev/null 2>&1; then \
+		echo "Run: valgrind --leak-check=full --show-leak-kinds=all ./$(PROGNAME) [args]"; \
+	else \
+		echo "ERROR: valgrind not installed. Install with: apt install valgrind"; \
+		exit 1; \
+	fi
 
 clean:
 	rm -f $(OBJS) $(PROGNAME) config.h
