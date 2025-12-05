@@ -5,11 +5,13 @@
 * NEW configurable certificate key types: RSA2048, RSA4096, ECDSA P-256, ECDSA P-384
 * NEW CLI option `-K KEY_TYPE` to select certificate key algorithm (0-3)
 * NEW CLI option `-d CERT_DAYS` to configure certificate validity (default: 100, max: 825)
+* NEW CA files separated into pem_dir/rootCA/ subdirectory (protects CA from bulk cert deletion)
 * NEW flexible CA hierarchy with search order:
-  - Primary: rootca.crt/rootca.key (Root CA)
-  - Secondary: subca.crt/subca.key (Subordinate CA for signing)
-  - Cross-signed: subca.cs.crt (optional, for chain building)
-  - Legacy fallback: ca.crt/ca.key (backwards compatible)
+  - Primary: rootCA/rootca.crt + rootCA/rootca.key (Root CA)
+  - Secondary: rootCA/subca.crt + rootCA/subca.key (Subordinate CA for signing)
+  - Cross-signed: rootCA/subca.cs.crt (optional, for chain building)
+  - Legacy fallback: rootCA/ca.crt + rootCA/ca.key (backwards compatible)
+  - Passphrase files: rootCA/<keyname>.key.passphrase
 * NEW comprehensive cipher suite configuration with AEAD-first ordering
 * NEW configure options: --disable-tongchou, --enable-bsi-strict
 * CHANGED default certificate validity from 825 to 100 days

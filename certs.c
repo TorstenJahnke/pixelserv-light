@@ -598,13 +598,14 @@ static int pem_passwd_cb(char *buf, int size, int rwflag, void *u) {
     char *fname = NULL;
     passwd_cb_arg_t *arg = (passwd_cb_arg_t *)u;
 
-    if (asprintf(&fname, "%s/%s.key.passphrase", arg->pem_dir, arg->key_name) < 0)
+    /* Try pem_dir/rootCA/<key_name>.key.passphrase first */
+    if (asprintf(&fname, "%s/rootCA/%s.key.passphrase", arg->pem_dir, arg->key_name) < 0)
         goto quit_cb;
 
     if ((fp = open(fname, O_RDONLY)) < 0) {
-        /* Try legacy ca.key.passphrase for backwards compatibility */
+        /* Try legacy pem_dir/rootCA/ca.key.passphrase */
         free(fname);
-        if (asprintf(&fname, "%s/ca.key.passphrase", arg->pem_dir) < 0)
+        if (asprintf(&fname, "%s/rootCA/ca.key.passphrase", arg->pem_dir) < 0)
             goto quit_cb;
         if ((fp = open(fname, O_RDONLY)) < 0)
             log_msg(LGG_DEBUG, "%s: no passphrase file found", __FUNCTION__);
@@ -677,16 +678,16 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     passwd_arg.pem_dir = pem_dir;
 
     /*
-     * New CA hierarchy:
-     * - rootca.crt + rootca.key (required, at least one CA)
-     * - subca.crt + subca.key (optional, used for signing if present)
-     * - subca.cs.crt (optional, cross-signed certificate for chain)
+     * New CA hierarchy (all files under pem_dir/rootCA/):
+     * - rootCA/rootca.crt + rootCA/rootca.key (required, at least one CA)
+     * - rootCA/subca.crt + rootCA/subca.key (optional, used for signing if present)
+     * - rootCA/subca.cs.crt (optional, cross-signed certificate for chain)
      *
-     * Fallback to legacy ca.crt + ca.key if new files not found
+     * Fallback to legacy rootCA/ca.crt + rootCA/ca.key if new files not found
      */
 
     /* Try to load SubCA first (if exists, this is the signing CA) */
-    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/subca.crt", pem_dir);
+    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/subca.crt", pem_dir);
     fp = fopen(cert_file, "r");
     if (fp) {
         issuer_cert = X509_new();
@@ -703,7 +704,7 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
 
     /* If no SubCA, try RootCA */
     if (!use_subca) {
-        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootca.crt", pem_dir);
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/rootca.crt", pem_dir);
         fp = fopen(cert_file, "r");
         if (fp) {
             issuer_cert = X509_new();
@@ -720,7 +721,7 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
 
     /* Fallback to legacy ca.crt */
     if (!issuer_cert) {
-        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/ca.crt", pem_dir);
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/ca.crt", pem_dir);
         fp = fopen(cert_file, "r");
         if (fp) {
             issuer_cert = X509_new();
@@ -736,7 +737,7 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     }
 
     if (!issuer_cert) {
-        log_msg(LGG_ERR, "%s: no CA certificate found (tried subca.crt, rootca.crt, ca.crt)", __FUNCTION__);
+        log_msg(LGG_ERR, "%s: no CA certificate found in %s/rootCA/ (tried subca.crt, rootca.crt, ca.crt)", __FUNCTION__, pem_dir);
         return;
     }
 
@@ -746,19 +747,19 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     /* Build CA chain: SubCA (or SubCA cross-signed) + RootCA */
     if (use_subca) {
         /* Try cross-signed SubCA first, fall back to regular SubCA */
-        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/subca.cs.crt", pem_dir);
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/subca.cs.crt", pem_dir);
         if (!load_cert_to_chain(&ct->cachain, cert_file)) {
-            snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/subca.crt", pem_dir);
+            snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/subca.crt", pem_dir);
             load_cert_to_chain(&ct->cachain, cert_file);
         }
         /* Add RootCA to chain */
-        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootca.crt", pem_dir);
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/rootca.crt", pem_dir);
         load_cert_to_chain(&ct->cachain, cert_file);
     } else {
         /* Just RootCA or legacy ca.crt */
-        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootca.crt", pem_dir);
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/rootca.crt", pem_dir);
         if (!load_cert_to_chain(&ct->cachain, cert_file)) {
-            snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/ca.crt", pem_dir);
+            snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/ca.crt", pem_dir);
             load_cert_to_chain(&ct->cachain, cert_file);
         }
     }
@@ -769,7 +770,7 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     /* Load private key - must match the signing certificate */
     if (use_subca) {
         /* SubCA mode: MUST have subca.key */
-        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/subca.key", pem_dir);
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/subca.key", pem_dir);
         passwd_arg.key_name = "subca";
         fp = fopen(cert_file, "r");
         if (fp && PEM_read_PrivateKey(fp, &ct->privkey, pem_passwd_cb, &passwd_arg)) {
@@ -786,7 +787,7 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     }
 
     /* RootCA mode: try rootca.key first */
-    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootca.key", pem_dir);
+    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/rootca.key", pem_dir);
     passwd_arg.key_name = "rootca";
     fp = fopen(cert_file, "r");
     if (fp && PEM_read_PrivateKey(fp, &ct->privkey, pem_passwd_cb, &passwd_arg)) {
@@ -797,7 +798,7 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     if (fp) fclose(fp);
 
     /* Fallback to legacy ca.key */
-    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/ca.key", pem_dir);
+    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/ca.key", pem_dir);
     passwd_arg.key_name = "ca";
     fp = fopen(cert_file, "r");
     if (!fp || !PEM_read_PrivateKey(fp, &ct->privkey, pem_passwd_cb, &passwd_arg))
