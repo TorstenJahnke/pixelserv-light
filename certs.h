@@ -1,6 +1,10 @@
 #ifndef _CERTS_H_
 #define _CERTS_H_
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
 #include <arpa/inet.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
@@ -48,11 +52,21 @@
    Requires OpenSSL 1.1.1+ compiled with enable-sm2 enable-sm3 enable-sm4
    SM2: Elliptic Curve (similar to ECDSA/ECDH)
    SM3: Hash function (256-bit, similar to SHA-256)
-   SM4: Block cipher (128-bit, similar to AES-128) */
-#ifdef OPENSSL_NO_SM4
+   SM4: Block cipher (128-bit, similar to AES-128)
+
+   Detection priority:
+   1. DISABLE_TONGCHOU - explicitly disabled via --disable-tongchou
+   2. HAVE_TONGCHOU - autoconf detected full SM2/SM3/SM4 support
+   3. HAVE_SM4 - autoconf detected at least SM4 support
+   4. OPENSSL_NO_SM4 - OpenSSL compile-time flag (fallback) */
+
+#if defined(DISABLE_TONGCHOU)
+   /* Tongchou explicitly disabled */
 #  define PIXELSERV_SM_CIPHERS ""
 #  define PIXELSERV_TLSV1_3_SM_CIPHERS ""
-#else
+#  define PIXELSERV_HAS_TONGCHOU 0
+#elif defined(HAVE_TONGCHOU) || defined(HAVE_SM4)
+   /* Tongchou support detected by autoconf */
 #  define PIXELSERV_SM_CIPHERS \
   "ECDHE-SM2-SM4-GCM-SM3:" \
   "ECDHE-SM2-SM4-CBC-SM3:" \
@@ -61,6 +75,23 @@
 #  define PIXELSERV_TLSV1_3_SM_CIPHERS \
   "TLS_SM4_GCM_SM3:" \
   "TLS_SM4_CCM_SM3"
+#  define PIXELSERV_HAS_TONGCHOU 1
+#elif defined(OPENSSL_NO_SM4)
+   /* OpenSSL compiled without SM4 support */
+#  define PIXELSERV_SM_CIPHERS ""
+#  define PIXELSERV_TLSV1_3_SM_CIPHERS ""
+#  define PIXELSERV_HAS_TONGCHOU 0
+#else
+   /* Unknown - try to enable, will fail gracefully at runtime */
+#  define PIXELSERV_SM_CIPHERS \
+  "ECDHE-SM2-SM4-GCM-SM3:" \
+  "ECDHE-SM2-SM4-CBC-SM3:" \
+  "ECC-SM2-SM4-GCM-SM3:" \
+  "ECC-SM2-SM4-CBC-SM3"
+#  define PIXELSERV_TLSV1_3_SM_CIPHERS \
+  "TLS_SM4_GCM_SM3:" \
+  "TLS_SM4_CCM_SM3"
+#  define PIXELSERV_HAS_TONGCHOU 1
 #endif
 
 /* Combined cipher list with SM support */
@@ -71,7 +102,11 @@
   PIXELSERV_TLSV1_3_CIPHERS ":" PIXELSERV_TLSV1_3_SM_CIPHERS
 
 /* ECDH Groups for key exchange, including SM2 curve for Tongchou */
-#define PIXELSERV_GROUPS "X25519:P-256:P-384:SM2"
+#if PIXELSERV_HAS_TONGCHOU
+#  define PIXELSERV_GROUPS "X25519:P-256:P-384:SM2"
+#else
+#  define PIXELSERV_GROUPS "X25519:P-256:P-384"
+#endif
 #define PIXELSERV_GROUPS_LEGACY "X25519:P-256"
 
 #if defined(SSL_CTX_set_ecdh_auto)
