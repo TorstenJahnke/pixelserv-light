@@ -1,3 +1,24 @@
+2025-12-05 v2.5.0 (Torsten Jahnke)
+
+* NEW support for SM2/SM3/SM4 (Tongchou/国密) Chinese national cryptography ciphers
+* NEW BSI TR-02102-2 / NIS2 compliance mode with Brainpool curves and X448 support
+* NEW configurable certificate key types: RSA2048, RSA4096, ECDSA P-256, ECDSA P-384
+* NEW CLI option `-K KEY_TYPE` to select certificate key algorithm (0-3)
+* NEW CLI option `-d CERT_DAYS` to configure certificate validity (default: 100, max: 825)
+* NEW flexible CA hierarchy: rootca.crt/key, subca.crt/key with cross-signing support
+* NEW fallback to legacy ca.crt/ca.key for backwards compatibility
+* NEW comprehensive cipher suite configuration with AEAD-first ordering
+* NEW configure options: --disable-tongchou, --enable-bsi-strict
+* CHANGED default certificate validity from 825 to 100 days
+* CHANGED certificate writing order to Key → Cert (industry standard)
+* CHANGED improved OpenSSL 3.0 compatibility (EVP_RSA_gen, EVP_EC_gen)
+* FIXED thread safety: RW-lock for SSL context table prevents race conditions
+* FIXED atomic operations for all stats counters (lock-free STAT_INC/STAT_DEC)
+* FIXED double-check locking in sslctx_tbl_cache() for concurrent cert loading
+* FIXED BIO NULL pointer check crash in certificate loading
+* FIXED removed deprecated ERR_GET_FUNC for OpenSSL 3.0+
+* FIXED log_msg format string bug (missing __FUNCTION__)
+
 2019-12-13 v2.3.1
 
 * NEW check and purge expired certs on-the-fly. Generate new ones to replace the expired automatically.
