@@ -142,6 +142,7 @@ OBJDIR := build
 # Base flags
 BASE_CFLAGS := -std=gnu11 -Wall -Wextra -Wno-unused-parameter
 BASE_CFLAGS += -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
+BASE_CFLAGS += -DDROP_ROOT
 BASE_CFLAGS += -ffunction-sections -fdata-sections
 BASE_CFLAGS += $(SSL_CFLAGS)
 
