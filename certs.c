@@ -187,13 +187,13 @@ static inline int seqlock_read_retry(uint32_t start_seq) {
     return start_seq != atomic_load_explicit(&sslctx_tbl_seqlock, memory_order_relaxed);
 }
 
-static inline void seqlock_write_begin(void) {
-    uint32_t seq;
-    do {
-        seq = atomic_load_explicit(&sslctx_tbl_seqlock, memory_order_relaxed);
-    } while ((seq & 1) || !atomic_compare_exchange_weak_explicit(
-        &sslctx_tbl_seqlock, &seq, seq + 1, memory_order_acquire, memory_order_relaxed));
-    /* seq is now odd - write in progress */
+/* Try to acquire write lock - returns 1 on success, 0 if busy (NO SPINNING) */
+static inline int seqlock_write_trylock(void) {
+    uint32_t seq = atomic_load_explicit(&sslctx_tbl_seqlock, memory_order_relaxed);
+    if (seq & 1)
+        return 0;  /* Write in progress - don't wait */
+    return atomic_compare_exchange_strong_explicit(
+        &sslctx_tbl_seqlock, &seq, seq + 1, memory_order_acquire, memory_order_relaxed);
 }
 
 static inline void seqlock_write_end(void) {
@@ -426,13 +426,17 @@ static int sslctx_tbl_insert(const char *cert_name, SSL_CTX *sslctx, int ins_idx
     return sslctx_tbl_insert_locked(cert_name, sslctx, ins_idx);
 }
 
-/* Lock-free cache insertion using seqlock for write synchronization */
+/* Lock-free cache insertion using seqlock for write synchronization
+ * If another writer holds the lock, we skip caching (NO BLOCKING) */
 static int sslctx_tbl_cache(const char *cert_name, SSL_CTX *sslctx, int ins_idx)
 {
     int ret = -1;
 
-    /* Acquire write lock via seqlock */
-    seqlock_write_begin();
+    /* Try to acquire write lock - if busy, skip caching (cert will reload next time) */
+    if (!seqlock_write_trylock()) {
+        /* Another writer active - don't block, just use the sslctx without caching */
+        return 0;  /* Not an error - we just didn't cache */
+    }
 
     /* Double-check: another thread might have cached this cert while we loaded it */
     sslctx_cache_struct key, *found;
@@ -459,13 +463,16 @@ static int sslctx_tbl_cache(const char *cert_name, SSL_CTX *sslctx, int ins_idx)
     return ret;
 }
 
-/* Lock-free purge using seqlock for write synchronization */
+/* Lock-free purge using seqlock for write synchronization
+ * If another writer holds the lock, we skip purging (NO BLOCKING) */
 static int sslctx_tbl_purge(int idx) {
     int end = atomic_load(&sslctx_tbl_end);
     if (idx < 0 || idx >= end || end <= 0)
         return -1;
 
-    seqlock_write_begin();
+    /* Try to acquire write lock - if busy, skip purging (will try again later) */
+    if (!seqlock_write_trylock())
+        return -1;  /* Another writer active - don't block */
 
     /* Re-validate idx after acquiring seqlock */
     end = atomic_load(&sslctx_tbl_end);
