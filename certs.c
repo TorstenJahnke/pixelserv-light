@@ -1012,6 +1012,17 @@ void cert_tlstor_cleanup(cert_tlstor_t *c)
 
 #define CERT_INDEX_DIR "index"
 #define CERT_INDEX_SHARDS 256       /* Number of shards (256 = 0x00-0xff) */
+#define CERT_INDEX_SHARD_BITS 8     /* log2(CERT_INDEX_SHARDS) */
+#define CERT_INDEX_VERSION 2
+
+/* Index entry - stored in shard files (tab-separated) */
+typedef struct {
+    char domain[PIXELSERV_MAX_SERVER_NAME + 1];
+    time_t created;
+    time_t expires;
+    int key_type;  /* 0=RSA2048, 1=RSA4096, 2=ECDSA-P256, 3=ECDSA-P384 */
+} cert_index_entry_t;
+
 /* Shard statistics (atomic) */
 static _Atomic uint64_t cert_index_total_entries = 0;
 static char *cert_index_base_path = NULL;
@@ -1166,6 +1177,12 @@ static inline int cert_index_mem_count(void) {
     return atomic_load(&cert_mem_index_count);
 }
 
+/* Check if domain exists in index - uses in-memory lookup */
+static int cert_index_exists(const char *pem_dir, const char *domain) {
+    (void)pem_dir;  /* No longer needed - using memory index */
+    return cert_index_mem_lookup(domain);
+}
+
 /* Ensure index directory and shard structure exists, load into memory */
 static int cert_index_init(const char *pem_dir) {
     char path[PIXELSERV_MAX_PATH];
@@ -1268,6 +1285,140 @@ static int cert_index_add(const char *pem_dir, const char *domain, time_t create
     cert_index_mem_insert(domain, expires);
 
     return 0;
+}
+
+/* Load a single shard into memory */
+static cert_index_entry_t* cert_index_load_shard(const char *pem_dir, int shard, int *count) {
+    char path[PIXELSERV_MAX_PATH];
+    FILE *fp;
+    char line[PIXELSERV_MAX_SERVER_NAME + 64];
+    cert_index_entry_t *entries = NULL;
+    int capacity = 0, n = 0;
+
+    *count = 0;
+
+    cert_index_shard_path(pem_dir, shard, path, PIXELSERV_MAX_PATH);
+    fp = fopen(path, "r");
+    if (!fp)
+        return NULL;
+
+    capacity = 1024;
+    entries = malloc(capacity * sizeof(cert_index_entry_t));
+    if (!entries) {
+        fclose(fp);
+        return NULL;
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        char domain[PIXELSERV_MAX_SERVER_NAME + 1];
+        long created, expires;
+        int key_type;
+
+        if (sscanf(line, "%255s\t%ld\t%ld\t%d", domain, &created, &expires, &key_type) == 4) {
+            if (n >= capacity) {
+                capacity *= 2;
+                cert_index_entry_t *new_entries = realloc(entries, capacity * sizeof(cert_index_entry_t));
+                if (!new_entries) {
+                    free(entries);
+                    fclose(fp);
+                    return NULL;
+                }
+                entries = new_entries;
+            }
+            strncpy(entries[n].domain, domain, PIXELSERV_MAX_SERVER_NAME);
+            entries[n].domain[PIXELSERV_MAX_SERVER_NAME] = '\0';
+            entries[n].created = (time_t)created;
+            entries[n].expires = (time_t)expires;
+            entries[n].key_type = key_type;
+            n++;
+        }
+    }
+    fclose(fp);
+    *count = n;
+    return entries;
+}
+
+/* Rebuild single shard from disk scan - can run in parallel for different shards */
+static int cert_index_rebuild_shard(const char *pem_dir, int shard) {
+    char path[PIXELSERV_MAX_PATH];
+    DIR *dir;
+    struct dirent *entry;
+    FILE *fp;
+    int count = 0;
+
+    dir = opendir(pem_dir);
+    if (!dir)
+        return -1;
+
+    cert_index_shard_path(pem_dir, shard, path, PIXELSERV_MAX_PATH);
+    fp = fopen(path, "w");
+    if (!fp) {
+        closedir(dir);
+        return -1;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        struct stat st;
+        char cert_path[PIXELSERV_MAX_PATH];
+
+        /* Skip directories and special files */
+        if (entry->d_name[0] == '.')
+            continue;
+        if (strcmp(entry->d_name, "rootCA") == 0 || strcmp(entry->d_name, CERT_INDEX_DIR) == 0)
+            continue;
+        if (strcmp(entry->d_name, "prefetch") == 0)
+            continue;
+
+        /* Only process entries belonging to this shard */
+        if (cert_index_shard(entry->d_name) != shard)
+            continue;
+
+        snprintf(cert_path, PIXELSERV_MAX_PATH, "%s/%s", pem_dir, entry->d_name);
+        if (stat(cert_path, &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+
+        /* Check file is a PEM certificate */
+        FILE *cert_fp = fopen(cert_path, "r");
+        if (cert_fp) {
+            char header[32];
+            if (fgets(header, sizeof(header), cert_fp) &&
+                strstr(header, "-----BEGIN")) {
+                fprintf(fp, "%s\t%ld\t%ld\t%d\n",
+                        entry->d_name,
+                        (long)st.st_mtime,
+                        (long)(st.st_mtime + cert_validity_days * 24 * 3600),
+                        cert_key_type);
+                count++;
+            }
+            fclose(cert_fp);
+        }
+    }
+    closedir(dir);
+    fclose(fp);
+
+    return count;
+}
+
+/* Full index rebuild - parallelizable across shards */
+static int cert_index_rebuild(const char *pem_dir) {
+    int total = 0;
+
+    log_msg(LGG_NOTICE, "Rebuilding certificate index (%d shards)...", CERT_INDEX_SHARDS);
+
+    for (int s = 0; s < CERT_INDEX_SHARDS; s++) {
+        int count = cert_index_rebuild_shard(pem_dir, s);
+        if (count > 0)
+            total += count;
+    }
+
+    atomic_store(&cert_index_total_entries, total);
+    log_msg(LGG_NOTICE, "Certificate index rebuilt: %d entries", total);
+    return total;
+}
+
+/* Get total certificate count (lock-free read) */
+static inline uint64_t cert_index_count(void) {
+    return atomic_load(&cert_index_total_entries);
 }
 
 /* =============================================================================
