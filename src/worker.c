@@ -341,6 +341,9 @@ static int check_keepalive(const char *buf)
 
 /*
  * Generate response for a connection that just finished reading
+ *
+ * For static responses (favicon, pre-built responses), we point write_buf
+ * directly to the static data. For dynamic responses, we copy to the pool buffer.
  */
 static int worker_generate_response(connection_t *conn)
 {
@@ -350,11 +353,14 @@ static int worker_generate_response(connection_t *conn)
     /* Parse HTTP request */
     if (parse_http_request(conn->hot.read_buf, method, sizeof(method),
                            path, sizeof(path)) != 0) {
-        /* Bad request - send 404 */
+        /* Bad request - send 404 (static response) */
         response_t resp = RESP_404_NOT_FOUND;
-        memcpy(conn->hot.write_buf, resp.data, resp.len);
+        /* Free pool buffer, use static directly */
+        buf_free_small(conn->hot.write_buf);
+        conn->hot.write_buf = (char *)resp.data;
         conn->hot.write_len = resp.len;
         conn->hot.write_pos = 0;
+        conn->hot.flags |= CONN_FLAG_STATIC_RESP;
         return 0;
     }
 
@@ -367,19 +373,29 @@ static int worker_generate_response(connection_t *conn)
     response_t resp;
     if (response_generate(path, method, &resp) != 0) {
         resp = RESP_404_NOT_FOUND;
+        resp.is_static = 1;
     }
 
-    /* Copy response to write buffer (limited by buffer size) */
-    size_t copy_len = resp.len;
-    if (copy_len > 4096)
-        copy_len = 4096;  /* Buffer size limit */
+    if (resp.is_static) {
+        /* Static response (favicon, pre-built) - use directly */
+        buf_free_small(conn->hot.write_buf);
+        conn->hot.write_buf = (char *)resp.data;
+        conn->hot.write_len = resp.len;
+        conn->hot.write_pos = 0;
+        conn->hot.flags |= CONN_FLAG_STATIC_RESP;
+    } else {
+        /* Dynamic response - copy to pool buffer (with size limit) */
+        size_t copy_len = resp.len;
+        if (copy_len > 4096)
+            copy_len = 4096;  /* Buffer size limit */
 
-    memcpy(conn->hot.write_buf, resp.data, copy_len);
-    conn->hot.write_len = copy_len;
-    conn->hot.write_pos = 0;
+        memcpy(conn->hot.write_buf, resp.data, copy_len);
+        conn->hot.write_len = copy_len;
+        conn->hot.write_pos = 0;
 
-    /* Free dynamic response */
-    response_free(&resp);
+        /* Free dynamic response */
+        response_free(&resp);
+    }
 
     return 0;
 }
@@ -409,9 +425,11 @@ void worker_handle_connection(worker_t *worker, connection_t *conn, uint32_t eve
         atomic_fetch_add(&worker->bytes_written, conn->cold.bytes_written);
         atomic_fetch_add(&worker->requests_handled, conn->cold.request_count);
 
-        /* Free buffers */
+        /* Free buffers (but not static response buffers) */
         if (conn->hot.read_buf) buf_free_small(conn->hot.read_buf);
-        if (conn->hot.write_buf) buf_free_small(conn->hot.write_buf);
+        if (conn->hot.write_buf && !(conn->hot.flags & CONN_FLAG_STATIC_RESP)) {
+            buf_free_small(conn->hot.write_buf);
+        }
 
         /* Close and free connection */
         conn_close(conn);
@@ -453,7 +471,9 @@ void worker_maintenance(worker_t *worker)
             epoll_ctl(worker->epfd, EPOLL_CTL_DEL, conn->hot.fd, NULL);
 
             if (conn->hot.read_buf) buf_free_small(conn->hot.read_buf);
-            if (conn->hot.write_buf) buf_free_small(conn->hot.write_buf);
+            if (conn->hot.write_buf && !(conn->hot.flags & CONN_FLAG_STATIC_RESP)) {
+                buf_free_small(conn->hot.write_buf);
+            }
 
             conn_close(conn);
             conn_free(&worker->conn_pool, conn);

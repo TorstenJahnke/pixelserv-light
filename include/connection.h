@@ -50,6 +50,7 @@ typedef enum {
 #define CONN_FLAG_WANT_WRITE    (1 << 4)  /* Waiting for EPOLLOUT */
 #define CONN_FLAG_CERT_PENDING  (1 << 5)  /* Waiting for cert generation */
 #define CONN_FLAG_ERROR         (1 << 6)  /* Error occurred */
+#define CONN_FLAG_STATIC_RESP   (1 << 7)  /* write_buf is static (don't free) */
 
 /* =============================================================================
  * Connection Structure

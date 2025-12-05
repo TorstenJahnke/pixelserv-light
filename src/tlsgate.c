@@ -33,6 +33,7 @@
 #include "../include/connection.h"
 #include "../include/buffer_pool.h"
 #include "../include/worker.h"
+#include "../include/response.h"
 
 /* =============================================================================
  * Configuration
@@ -398,6 +399,9 @@ int main(int argc, char *argv[])
             return 1;
         }
     }
+
+    /* Initialize response system (pre-build favicon, etc.) */
+    response_init();
 
     /* Initialize worker pool */
     if (worker_pool_init(&g_worker_pool, config.num_workers,

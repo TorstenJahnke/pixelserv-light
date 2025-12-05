@@ -359,9 +359,14 @@ int response_generate(const char *path, const char *method, response_t *resp)
     /* Extract extension from path */
     const char *ext = get_extension(path);
 
-    /* Special case: favicon.ico */
+    /* Special case: favicon.ico - use pre-built 288KB multi-icon response */
     if (path && strcasecmp(path, "/favicon.ico") == 0) {
-        return response_for_extension("ico", resp);
+        if (favicon_response && favicon_response_len > 0) {
+            resp->data = favicon_response;
+            resp->len = favicon_response_len;
+            resp->is_static = 1;  /* Don't free - shared static buffer */
+            return 0;
+        }
     }
 
     /* Generate response based on extension */
