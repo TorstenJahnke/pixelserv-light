@@ -631,7 +631,7 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
     if(pem_fn[0] == '_') pem_fn[0] = '*';
 
     // -- generate key based on cert_key_type
-    // 0=RSA2048, 1=RSA4096, 2=ECDSA-P256, 3=ECDSA-P384
+    // 0=RSA2048, 1=RSA4096, 2=ECDSA-P256, 3=ECDSA-P384, 4=RSA8192, 5=RSA16384
     BIGNUM *e = BN_new();
     BN_set_word(e, RSA_F4);
 
@@ -678,6 +678,36 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
             }
             key = EVP_PKEY_new();
             EVP_PKEY_assign_EC_KEY(key, ec);
+        }
+#endif
+        break;
+    case 4: // RSA 8192
+#if OPENSSL_VERSION_MAJOR >= 3
+        key = EVP_RSA_gen(8192);
+#else
+        {
+            RSA *rsa = RSA_new();
+            if (RSA_generate_key_ex(rsa, 8192, e, NULL) < 0) {
+                RSA_free(rsa);
+                goto free_all;
+            }
+            key = EVP_PKEY_new();
+            EVP_PKEY_assign_RSA(key, rsa);
+        }
+#endif
+        break;
+    case 5: // RSA 16384
+#if OPENSSL_VERSION_MAJOR >= 3
+        key = EVP_RSA_gen(16384);
+#else
+        {
+            RSA *rsa = RSA_new();
+            if (RSA_generate_key_ex(rsa, 16384, e, NULL) < 0) {
+                RSA_free(rsa);
+                goto free_all;
+            }
+            key = EVP_PKEY_new();
+            EVP_PKEY_assign_RSA(key, rsa);
         }
 #endif
         break;
@@ -1025,7 +1055,7 @@ typedef struct {
     char domain[PIXELSERV_MAX_SERVER_NAME + 1];
     time_t created;
     time_t expires;
-    int key_type;  /* 0=RSA2048, 1=RSA4096, 2=ECDSA-P256, 3=ECDSA-P384 */
+    int key_type;  /* 0=RSA2048, 1=RSA4096, 2=ECDSA-P256, 3=ECDSA-P384, 4=RSA8192, 5=RSA16384 */
 } cert_index_entry_t;
 
 /* Forward declarations for index functions */

@@ -57,7 +57,7 @@
                                 // For 10M+ domains, use -c 5000000
 #define DEFAULT_CERT_VALIDITY_DAYS 100
                                 // default certificate validity in days
-#define DEFAULT_CERT_KEY_TYPE 0 // 0=RSA2048, 1=RSA4096, 2=ECDSA-P256, 3=ECDSA-P384
+#define DEFAULT_CERT_KEY_TYPE 2 // 0=RSA2048, 1=RSA4096, 2=ECDSA-P256, 3=ECDSA-P384, 4=RSA8192, 5=RSA16384
 #define SECOND_PORT "443"
 #define MAX_PORTS 10
 #define MAX_TLS_PORTS 9         // PLEASE ENSURE MAX_TLS_PORTS < MAX_PORTS
