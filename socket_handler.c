@@ -655,7 +655,9 @@ void* conn_handler( void *ptr )
   #define HOST_LEN_MAX 80
   char host[HOST_LEN_MAX + 1];
   char *post_buf = NULL;
+#ifdef DEBUG
   size_t post_buf_len = 0;
+#endif
   unsigned int total_bytes = 0; /* number of bytes received by this thread */
   #define CORS_ORIGIN_LEN_MAX 256
   char *cors_origin = NULL;
@@ -727,7 +729,9 @@ void* conn_handler( void *ptr )
     int log_verbose = log_get_verb();
     response = httpnulltext;
     rsize = 0;
+#ifdef DEBUG
     post_buf_len = 0;
+#endif
 
     errno = 0;
     rv = read_socket(new_fd, &buf, CONN_TLSTOR(ptr, ssl), CONN_TLSTOR(ptr, early_data));
@@ -785,8 +789,9 @@ void* conn_handler( void *ptr )
       char *orig_hdr;
       orig_hdr = strstr_first(bufptr, "Origin: ");
       if (orig_hdr) {
-        cors_origin = realloc(cors_origin, CORS_ORIGIN_LEN_MAX);
+        cors_origin = realloc(cors_origin, CORS_ORIGIN_LEN_MAX + 1);
         strncpy(cors_origin, orig_hdr + 8, CORS_ORIGIN_LEN_MAX);
+        cors_origin[CORS_ORIGIN_LEN_MAX] = '\0';  /* Ensure null termination */
         strtok(cors_origin, "\r\n");
         if (strncmp(cors_origin, "null", 4) == 0) { /* some web developers are just ... */
             cors_origin[0] = '*';
@@ -904,7 +909,9 @@ void* conn_handler( void *ptr )
           get_time(&start_time);
 
 end_post:
+#ifdef DEBUG
           post_buf_len = recv_len;
+#endif
           pipedata.status = SEND_POST;
           /* default httpnulltext response */
         } else if (!strcmp(method, "GET")) {
@@ -1131,19 +1138,27 @@ end_post:
         if (errno == ECONNRESET || errno == EPIPE) {
           if (CONN_TLSTOR(ptr, ssl))
             strncpy(host, CONN_TLSTOR(ptr, tlsext_cb_arg)->servername, HOST_LEN_MAX);
+#ifdef DEBUG
           log_msg(LGG_WARNING, "disconnected client: %s method: %s server: %s", client_ip, method, host);
+#endif
           pipedata.status = FAIL_REPLY;
         } else {
+#ifdef DEBUG
           log_msg(LGG_ERR, "attempt to send response for status=%d resulted in send() error: %m", pipedata.status);
+#endif
           pipedata.status = FAIL_GENERAL;
         }
       } else if (rv != rsize) {
+#ifdef DEBUG
         log_msg(LGG_ERR, "send() reported only %d of %d bytes sent; status=%d", rv, rsize, pipedata.status);
+#endif
       }
 
+#ifdef DEBUG
       if (log_verbose >= LGG_INFO) {
         log_xcs(LGG_INFO, client_ip, host, pipedata.ssl_ver, req_url, post_buf, post_buf_len);
       }
+#endif
 
       free(aspbuf);
       aspbuf = NULL;

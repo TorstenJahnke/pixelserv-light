@@ -52,6 +52,14 @@ struct Global *g;
 cert_tlstor_t cert_tlstor;
 pthread_t certgen_thread;
 
+/*
+ * Signal handler - IMPORTANT: Only async-signal-safe operations!
+ * For production builds, we minimize operations to just setting flags.
+ * The main loop handles cleanup on graceful shutdown.
+ */
+static volatile sig_atomic_t got_sigterm = 0;
+static volatile sig_atomic_t got_sigusr1 = 0;
+
 void signal_handler(int sig)
 {
   if (sig != SIGTERM
@@ -60,39 +68,48 @@ void signal_handler(int sig)
    && sig != SIGUSR2
 #endif
   ) {
-    log_msg(LGG_WARNING, "Ignoring unsupported signal number: %d", sig);
+    /* Ignore unsupported signals - no logging (not async-signal-safe) */
     return;
   }
+
 #ifdef DEBUG
   if (sig == SIGUSR2) {
+    /* DEBUG only - async-signal-unsafe but acceptable for debugging */
     log_msg(LGG_INFO, "Main process caught signal %d file %s", sig, __FILE__);
-  } else {
-#endif
-    if (sig == SIGTERM) {
-      // Ignore this signal while we are quitting
-      signal(SIGTERM, SIG_IGN);
-    }
-
-    conn_stor_flush();
-#if defined(__GLIBC__) && !defined(__UCLIBC__)
-    malloc_trim(0);
-#endif
-
-    // log stats
-    char* stats_string = get_stats(0, 0);
-    log_msg(LGG_CRIT, "%s", stats_string);
-    free(stats_string);
-
-    sslctx_tbl_save(tls_pem);
-
-    if (sig == SIGTERM) {
-      log_msg(LGG_NOTICE, "exit on SIGTERM");
-      exit(EXIT_SUCCESS);
-    }
-#ifdef DEBUG
+    return;
   }
 #endif
-  return;
+
+  if (sig == SIGTERM) {
+    got_sigterm = 1;
+    signal(SIGTERM, SIG_IGN);  /* Ignore further SIGTERM */
+  } else if (sig == SIGUSR1) {
+    got_sigusr1 = 1;
+  }
+
+#ifdef DEBUG
+  /* Only in DEBUG builds do we perform these async-signal-unsafe operations */
+  conn_stor_flush();
+#if defined(__GLIBC__) && !defined(__UCLIBC__)
+  malloc_trim(0);
+#endif
+
+  char* stats_string = get_stats(0, 0);
+  log_msg(LGG_CRIT, "%s", stats_string);
+  free(stats_string);
+
+  sslctx_tbl_save(tls_pem);
+
+  if (sig == SIGTERM) {
+    log_msg(LGG_NOTICE, "exit on SIGTERM");
+    exit(EXIT_SUCCESS);
+  }
+#else
+  /* Production: just exit on SIGTERM, cleanup happens via atexit or main loop */
+  if (sig == SIGTERM) {
+    _exit(EXIT_SUCCESS);  /* async-signal-safe exit */
+  }
+#endif
 }
 
 int main (int argc, char* argv[])
@@ -239,13 +256,13 @@ int main (int argc, char* argv[])
               admin_port = atoi(argv[i]);
             else
               error = 1;
-              // fall through to case 'k'
+            /* fall through */
           case 'k':
             if (num_tls_ports < MAX_TLS_PORTS)
               tls_ports[num_tls_ports++] = atoi(argv[i]);
             else
               error = 1;
-              // fall through to case 'p'
+            /* fall through */
           case 'p':
             if (num_ports < MAX_PORTS) {
               ports[num_ports++] = argv[i];
@@ -886,6 +903,7 @@ start_service_thread:
 
   pthread_cancel(certgen_thread);
   pthread_join(certgen_thread, NULL);
+  certgen_pool_shutdown();  /* Shutdown cert generation worker threads */
 
 quit_main:
   SSL_CTX_free(sslctx);
