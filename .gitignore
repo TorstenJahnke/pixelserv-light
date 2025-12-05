@@ -20,12 +20,10 @@
 *.zip
 dist
 
-# Autotools
-*.in*
+# Autotools (legacy - no longer used)
 aclocal.m4
 autom4te.cache
 compile
-configure
 depcomp
 install-sh
 missing
@@ -35,7 +33,6 @@ config.h
 config.log
 config.status
 stamp-h1
-Makefile
 .deps/
 
 # Built binary
