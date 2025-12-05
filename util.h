@@ -25,7 +25,11 @@
 // preprocessor defines
 #define VERSION "2.5.3"
 
-#define BACKLOG SOMAXCONN       // how many pending connections queue will hold
+/* Listen backlog - how many pending connections queue will hold
+ * For 10M+ concurrent users, increase kernel limit:
+ *   sysctl -w net.core.somaxconn=65535
+ *   sysctl -w net.ipv4.tcp_max_syn_backlog=65535 */
+#define BACKLOG SOMAXCONN
 #define DEFAULT_IP "*"          // default IP address ALL - use this in messages only
 #define DEFAULT_PORT "80"       // the default port users will be connecting to
 #define DEFAULT_TIMEOUT 1       // default timeout for select() calls, in seconds
@@ -33,10 +37,25 @@
                                 // default keep-alive duration for HTTP/1.1 connections, in seconds
                                 // it's the time a connection will stay active
                                 // until another request comes and refreshes the timer
-#define DEFAULT_THREAD_MAX 65536  // maximum number of concurrent service threads (64K)
+/* Enterprise-scale defaults for 10M+ concurrent users
+ *
+ * Kernel tuning required for production:
+ *   sysctl -w net.core.somaxconn=65535
+ *   sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+ *   sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+ *   sysctl -w net.ipv4.tcp_tw_reuse=1
+ *   sysctl -w fs.file-max=10000000
+ *   ulimit -n 1000000
+ *
+ * For millions of certificates:
+ *   - Use -c 5000000 or higher for cert cache (hash table)
+ *   - Sharded index in pem_dir/index/ handles 5-10M certs
+ *   - SSL session cache: 1M sessions (PIXEL_SSL_SESS_CACHE_SIZE)
+ */
+#define DEFAULT_THREAD_MAX 65536  // maximum concurrent service threads (64K)
 #define DEFAULT_CERT_CACHE_SIZE 100000
-                                // default number of certificates to be cached in memory (100K)
-                                // For 10M+ domains, increase via -c option
+                                // SSL context cache slots (100K default)
+                                // For 10M+ domains, use -c 5000000
 #define DEFAULT_CERT_VALIDITY_DAYS 100
                                 // default certificate validity in days
 #define DEFAULT_CERT_KEY_TYPE 0 // 0=RSA2048, 1=RSA4096, 2=ECDSA-P256, 3=ECDSA-P384

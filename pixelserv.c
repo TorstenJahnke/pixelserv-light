@@ -37,7 +37,11 @@
 
 #define PAGE_SIZE 4096
 #define THREAD_STACK_SIZE  9*PAGE_SIZE
-#define TCP_FASTOPEN_QLEN  25
+
+/* TCP Fast Open queue length - allows pending connections waiting for data
+ * For 10M+ concurrent users, this should be at least 1024
+ * Kernel limit: /proc/sys/net/ipv4/tcp_fastopen (bits 0-1 must be set) */
+#define TCP_FASTOPEN_QLEN  1024
 
 const char *tls_pem = DEFAULT_PEM_PATH;
 int tls_ports[MAX_TLS_PORTS + 1] = {0}; /* one extra port for admin */

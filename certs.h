@@ -9,7 +9,10 @@
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 
-#define PIXEL_SSL_SESS_CACHE_SIZE 128*20
+/* Enterprise SSL session cache: 1 million sessions for 10M+ concurrent users
+ * Each session ~200-400 bytes, 1M sessions = ~200-400 MB RAM
+ * Adjust via -c option if memory constrained */
+#define PIXEL_SSL_SESS_CACHE_SIZE (1024 * 1024)
 #define PIXEL_SSL_SESS_TIMEOUT 3600 /* seconds */
 #define PIXEL_CERT_PIPE "/tmp/pixelcerts"
 #define PIXEL_TLS_EARLYDATA_SIZE 16384
