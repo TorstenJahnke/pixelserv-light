@@ -19,33 +19,65 @@
 #define PIXELSERV_MAX_PATH 1024
 #define PIXELSERV_MAX_SERVER_NAME 255
 
-/* Modern TLS 1.2 Cipher List (2024+)
-   Priority: CHACHA20 for mobile/ARM, then AES-GCM, with ECDHE key exchange
-   Compatibility: Android >= 4.4.2; Chrome >= 51; Firefox >= 49;
-   IE 11 Win 10; Edge >= 13; Safari >= 9; iOS >= 9
-   Legacy fallback for older clients included at end */
-#define PIXELSERV_CIPHER_LIST \
-  "ECDHE-ECDSA-CHACHA20-POLY1305:" \
-  "ECDHE-RSA-CHACHA20-POLY1305:" \
+/* TLS 1.2 Cipher List - BSI TR-02102-2 and NIS2 Compliant (2024+)
+
+   BSI TR-02102-2 Requirements:
+   - Only PFS (Perfect Forward Secrecy) cipher suites: ECDHE or DHE
+   - AES-GCM or AES-CBC with SHA-256/SHA-384 (no SHA-1)
+   - Key sizes: AES-128 or AES-256
+   - CHACHA20-POLY1305 accepted as alternative to AES-GCM
+
+   Priority order:
+   1. AEAD ciphers (GCM, CHACHA20) - preferred
+   2. CBC ciphers with SHA-256/384 - BSI compliant fallback
+   3. Legacy ciphers (SHA-1, no PFS) - only for compatibility, not BSI compliant
+
+   NIS2 Directive: Requires state-of-the-art encryption per BSI/ENISA guidelines */
+
+/* BSI TR-02102-2 compliant ciphers (recommended) */
+#define PIXELSERV_CIPHER_LIST_BSI \
   "ECDHE-ECDSA-AES256-GCM-SHA384:" \
   "ECDHE-RSA-AES256-GCM-SHA384:" \
+  "ECDHE-ECDSA-CHACHA20-POLY1305:" \
+  "ECDHE-RSA-CHACHA20-POLY1305:" \
   "ECDHE-ECDSA-AES128-GCM-SHA256:" \
   "ECDHE-RSA-AES128-GCM-SHA256:" \
   "DHE-RSA-AES256-GCM-SHA384:" \
   "DHE-RSA-AES128-GCM-SHA256:" \
+  "ECDHE-ECDSA-AES256-SHA384:" \
+  "ECDHE-RSA-AES256-SHA384:" \
+  "ECDHE-ECDSA-AES128-SHA256:" \
+  "ECDHE-RSA-AES128-SHA256:" \
+  "DHE-RSA-AES256-SHA256:" \
+  "DHE-RSA-AES128-SHA256"
+
+/* Legacy ciphers for older client compatibility (NOT BSI/NIS2 compliant) */
+#define PIXELSERV_CIPHER_LIST_LEGACY \
   "ECDHE-RSA-AES128-SHA:" \
   "DHE-RSA-AES128-SHA:" \
   "AES128-GCM-SHA256:" \
   "AES256-GCM-SHA384:" \
   "AES128-SHA"
 
-/* TLS 1.3 Cipher Suites (RFC 8446)
-   All mandatory and recommended suites including SM4 for Tongchou/GM compliance */
+/* Combined list: BSI-compliant first, then legacy for compatibility */
+#define PIXELSERV_CIPHER_LIST \
+  PIXELSERV_CIPHER_LIST_BSI ":" PIXELSERV_CIPHER_LIST_LEGACY
+
+/* Strict BSI-only mode (no legacy ciphers) */
+#define PIXELSERV_CIPHER_LIST_STRICT PIXELSERV_CIPHER_LIST_BSI
+
+/* TLS 1.3 Cipher Suites (RFC 8446) - BSI TR-02102-2 compliant
+   All TLS 1.3 ciphers use AEAD and are BSI/NIS2 compliant
+   Note: CCM_8 has shorter auth tag, excluded for strict BSI compliance */
 #define PIXELSERV_TLSV1_3_CIPHERS \
   "TLS_AES_256_GCM_SHA384:" \
-  "TLS_CHACHA20_POLY1305_SHA256:" \
   "TLS_AES_128_GCM_SHA256:" \
-  "TLS_AES_128_CCM_SHA256:" \
+  "TLS_CHACHA20_POLY1305_SHA256:" \
+  "TLS_AES_128_CCM_SHA256"
+
+/* TLS 1.3 with CCM_8 (shorter auth tag - may not meet strict BSI requirements) */
+#define PIXELSERV_TLSV1_3_CIPHERS_EXTENDED \
+  PIXELSERV_TLSV1_3_CIPHERS ":" \
   "TLS_AES_128_CCM_8_SHA256"
 
 /* SM2/SM3/SM4 Cipher Suites for Tongchou (Chinese GM/T Standards)
@@ -101,13 +133,55 @@
 #define PIXELSERV_TLSV1_3_CIPHERS_FULL \
   PIXELSERV_TLSV1_3_CIPHERS ":" PIXELSERV_TLSV1_3_SM_CIPHERS
 
-/* ECDH Groups for key exchange, including SM2 curve for Tongchou */
-#if PIXELSERV_HAS_TONGCHOU
-#  define PIXELSERV_GROUPS "X25519:P-256:P-384:SM2"
+/* ECDH Groups for key exchange - BSI TR-02102-2 compliant
+
+   BSI TR-02102-2 recommended curves:
+   - brainpoolP256r1, brainpoolP384r1, brainpoolP512r1 (BSI preferred)
+   - secp256r1 (P-256), secp384r1 (P-384) (NIST curves, widely supported)
+   - X25519, X448 (modern, high performance)
+
+   Note: Brainpool curves may not be supported by all clients */
+
+/* Full BSI-compliant groups including Brainpool (if available) */
+#if defined(HAVE_BRAINPOOL) && defined(HAVE_X448)
+#  define PIXELSERV_GROUPS_BSI \
+    "X25519:X448:P-256:P-384:P-521:" \
+    "brainpoolP256r1:brainpoolP384r1:brainpoolP512r1"
+#elif defined(HAVE_BRAINPOOL)
+#  define PIXELSERV_GROUPS_BSI \
+    "X25519:P-256:P-384:P-521:" \
+    "brainpoolP256r1:brainpoolP384r1:brainpoolP512r1"
+#elif defined(HAVE_X448)
+#  define PIXELSERV_GROUPS_BSI "X25519:X448:P-256:P-384:P-521"
 #else
-#  define PIXELSERV_GROUPS "X25519:P-256:P-384"
+#  define PIXELSERV_GROUPS_BSI "X25519:P-256:P-384:P-521"
 #endif
-#define PIXELSERV_GROUPS_LEGACY "X25519:P-256"
+
+/* Standard groups without Brainpool (wider compatibility) */
+#if defined(HAVE_X448)
+#  define PIXELSERV_GROUPS_STANDARD "X25519:X448:P-256:P-384:P-521"
+#else
+#  define PIXELSERV_GROUPS_STANDARD "X25519:P-256:P-384:P-521"
+#endif
+
+/* Groups with Tongchou SM2 support */
+#if PIXELSERV_HAS_TONGCHOU
+#  define PIXELSERV_GROUPS PIXELSERV_GROUPS_BSI ":SM2"
+#  define PIXELSERV_GROUPS_FULL PIXELSERV_GROUPS_STANDARD ":SM2"
+#else
+#  define PIXELSERV_GROUPS PIXELSERV_GROUPS_BSI
+#  define PIXELSERV_GROUPS_FULL PIXELSERV_GROUPS_STANDARD
+#endif
+
+/* Legacy groups for older OpenSSL versions */
+#define PIXELSERV_GROUPS_LEGACY "X25519:P-256:P-384"
+
+/* Select cipher list based on BSI strict mode */
+#if defined(BSI_STRICT_MODE)
+#  define PIXELSERV_CIPHER_LIST_ACTIVE PIXELSERV_CIPHER_LIST_STRICT
+#else
+#  define PIXELSERV_CIPHER_LIST_ACTIVE PIXELSERV_CIPHER_LIST
+#endif
 
 #if defined(SSL_CTX_set_ecdh_auto)
 # define PIXELSRV_SSL_HAS_ECDH_AUTO

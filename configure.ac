@@ -117,6 +117,58 @@ if test "x$enable_tongchou" = "xno"; then
     AC_DEFINE([DISABLE_TONGCHOU], [1], [Disable Tongchou support even if available])
 fi
 
+dnl BSI TR-02102-2 strict mode - only BSI/NIS2 compliant ciphers
+AC_ARG_ENABLE([bsi-strict],
+    AS_HELP_STRING([--enable-bsi-strict], [Enable BSI TR-02102-2 strict mode (no legacy ciphers, no SHA-1)]),
+    [enable_bsi_strict=$enableval],
+    [enable_bsi_strict=no])
+
+if test "x$enable_bsi_strict" = "xyes"; then
+    AC_DEFINE([BSI_STRICT_MODE], [1], [Enable BSI TR-02102-2 strict cipher mode])
+    AC_MSG_NOTICE([BSI TR-02102-2 strict mode enabled - legacy ciphers disabled])
+fi
+
+dnl Check for Brainpool curve support (BSI recommended)
+AC_MSG_CHECKING([for Brainpool elliptic curve support (BSI)])
+AC_LINK_IFELSE(
+    [AC_LANG_PROGRAM([[
+        #include <openssl/ec.h>
+        #include <openssl/obj_mac.h>
+    ]], [[
+        EC_KEY *key = EC_KEY_new_by_curve_name(NID_brainpoolP256r1);
+        if (key) EC_KEY_free(key);
+        return key ? 0 : 1;
+    ]])],
+    [
+        AC_MSG_RESULT([yes])
+        AC_DEFINE([HAVE_BRAINPOOL], [1], [Define if OpenSSL has Brainpool curve support])
+        have_brainpool=yes
+    ],
+    [
+        AC_MSG_RESULT([no])
+        have_brainpool=no
+    ])
+
+dnl Check for X448 curve support
+AC_MSG_CHECKING([for X448 curve support])
+AC_LINK_IFELSE(
+    [AC_LANG_PROGRAM([[
+        #include <openssl/evp.h>
+    ]], [[
+        EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X448, NULL);
+        if (ctx) EVP_PKEY_CTX_free(ctx);
+        return ctx ? 0 : 1;
+    ]])],
+    [
+        AC_MSG_RESULT([yes])
+        AC_DEFINE([HAVE_X448], [1], [Define if OpenSSL has X448 support])
+        have_x448=yes
+    ],
+    [
+        AC_MSG_RESULT([no])
+        have_x448=no
+    ])
+
 case "${host_os}" in
     darwin*)
         EXTRA_LDFLAGS+=" -Wl,-dead_strip"
@@ -138,7 +190,14 @@ AC_MSG_NOTICE([])
 AC_MSG_NOTICE([pixelserv-tls configuration summary:])
 AC_MSG_NOTICE([  TLS 1.3 support:      ${have_tls13:-check header}])
 AC_MSG_NOTICE([  CHACHA20-POLY1305:    ${have_chacha:-check result}])
-AC_MSG_NOTICE([  Tongchou SM2:         ${have_sm2:-no}])
-AC_MSG_NOTICE([  Tongchou SM3:         ${have_sm3:-no}])
-AC_MSG_NOTICE([  Tongchou SM4:         ${have_sm4:-no}])
+AC_MSG_NOTICE([])
+AC_MSG_NOTICE([  BSI TR-02102-2 / NIS2 compliance:])
+AC_MSG_NOTICE([    Brainpool curves:   ${have_brainpool:-no}])
+AC_MSG_NOTICE([    X448 curve:         ${have_x448:-no}])
+AC_MSG_NOTICE([    BSI strict mode:    ${enable_bsi_strict:-no}])
+AC_MSG_NOTICE([])
+AC_MSG_NOTICE([  Tongchou (Chinese GM/T) support:])
+AC_MSG_NOTICE([    SM2 (EC):           ${have_sm2:-no}])
+AC_MSG_NOTICE([    SM3 (Hash):         ${have_sm3:-no}])
+AC_MSG_NOTICE([    SM4 (Cipher):       ${have_sm4:-no}])
 AC_MSG_NOTICE([])

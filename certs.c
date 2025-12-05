@@ -870,10 +870,11 @@ static SSL_CTX* create_child_sslctx(const char* full_pem_path, const STACK_OF(X5
     SSL_CTX_set_session_cache_mode(sslctx, SSL_SESS_CACHE_NO_AUTO_CLEAR | SSL_SESS_CACHE_SERVER);
     SSL_CTX_set_timeout(sslctx, PIXEL_SSL_SESS_TIMEOUT);
     SSL_CTX_sess_set_cache_size(sslctx, 1);
-    /* Try full cipher list with SM support, fall back to standard if not available */
+    /* Try full cipher list with SM support, fall back to standard if not available
+       BSI_STRICT_MODE uses only BSI TR-02102-2 compliant ciphers */
     if (SSL_CTX_set_cipher_list(sslctx, PIXELSERV_CIPHER_LIST_FULL) <= 0) {
         log_msg(LGG_DEBUG, "%s: SM ciphers not available, using standard cipher list", __FUNCTION__);
-        if (SSL_CTX_set_cipher_list(sslctx, PIXELSERV_CIPHER_LIST) <= 0)
+        if (SSL_CTX_set_cipher_list(sslctx, PIXELSERV_CIPHER_LIST_ACTIVE) <= 0)
             log_msg(LGG_DEBUG, "%s: failed to set cipher list", __FUNCTION__);
     }
 #ifdef TLS1_3_VERSION
@@ -925,10 +926,11 @@ SSL_CTX* create_default_sslctx(const char *pem_dir)
 /*    // cb for server-side caching
     SSL_CTX_sess_set_new_cb(g_sslctx, new_session);
     SSL_CTX_sess_set_remove_cb(g_sslctx, remove_session); */
-    /* Try full cipher list with SM support, fall back to standard if not available */
+    /* Try full cipher list with SM support, fall back to standard if not available
+       BSI_STRICT_MODE uses only BSI TR-02102-2 compliant ciphers */
     if (SSL_CTX_set_cipher_list(g_sslctx, PIXELSERV_CIPHER_LIST_FULL) <= 0) {
         log_msg(LGG_DEBUG, "SM ciphers not available, using standard cipher list");
-        if (SSL_CTX_set_cipher_list(g_sslctx, PIXELSERV_CIPHER_LIST) <= 0)
+        if (SSL_CTX_set_cipher_list(g_sslctx, PIXELSERV_CIPHER_LIST_ACTIVE) <= 0)
             log_msg(LGG_DEBUG, "cipher_list cannot be set");
     }
 #ifndef TLS1_3_VERSION
