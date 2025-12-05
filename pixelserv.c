@@ -256,13 +256,13 @@ int main (int argc, char* argv[])
               admin_port = atoi(argv[i]);
             else
               error = 1;
-              // fall through to case 'k'
+            /* fall through */
           case 'k':
             if (num_tls_ports < MAX_TLS_PORTS)
               tls_ports[num_tls_ports++] = atoi(argv[i]);
             else
               error = 1;
-              // fall through to case 'p'
+            /* fall through */
           case 'p':
             if (num_ports < MAX_PORTS) {
               ports[num_ports++] = argv[i];

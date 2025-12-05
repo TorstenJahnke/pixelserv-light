@@ -789,8 +789,9 @@ void* conn_handler( void *ptr )
       char *orig_hdr;
       orig_hdr = strstr_first(bufptr, "Origin: ");
       if (orig_hdr) {
-        cors_origin = realloc(cors_origin, CORS_ORIGIN_LEN_MAX);
+        cors_origin = realloc(cors_origin, CORS_ORIGIN_LEN_MAX + 1);
         strncpy(cors_origin, orig_hdr + 8, CORS_ORIGIN_LEN_MAX);
+        cors_origin[CORS_ORIGIN_LEN_MAX] = '\0';  /* Ensure null termination */
         strtok(cors_origin, "\r\n");
         if (strncmp(cors_origin, "null", 4) == 0) { /* some web developers are just ... */
             cors_origin[0] = '*';

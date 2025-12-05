@@ -1178,7 +1178,7 @@ static inline int cert_index_mem_count(void) {
 }
 
 /* Check if domain exists in index - uses in-memory lookup */
-static int cert_index_exists(const char *pem_dir, const char *domain) {
+static int UNUSED cert_index_exists(const char *pem_dir, const char *domain) {
     (void)pem_dir;  /* No longer needed - using memory index */
     return cert_index_mem_lookup(domain);
 }
@@ -1288,7 +1288,7 @@ static int cert_index_add(const char *pem_dir, const char *domain, time_t create
 }
 
 /* Load a single shard into memory */
-static cert_index_entry_t* cert_index_load_shard(const char *pem_dir, int shard, int *count) {
+static UNUSED cert_index_entry_t* cert_index_load_shard(const char *pem_dir, int shard, int *count) {
     char path[PIXELSERV_MAX_PATH];
     FILE *fp;
     char line[PIXELSERV_MAX_SERVER_NAME + 64];
@@ -1400,7 +1400,7 @@ static int cert_index_rebuild_shard(const char *pem_dir, int shard) {
 }
 
 /* Full index rebuild - parallelizable across shards */
-static int cert_index_rebuild(const char *pem_dir) {
+static int UNUSED cert_index_rebuild(const char *pem_dir) {
     int total = 0;
 
     log_msg(LGG_NOTICE, "Rebuilding certificate index (%d shards)...", CERT_INDEX_SHARDS);
@@ -1587,7 +1587,9 @@ void *cert_generator(void *ptr) {
             continue;
         }
         ssize_t cnt;
-        if((cnt = read(fd, buf + strlen(half_token), PIXELSERV_MAX_SERVER_NAME * 4 - strlen(half_token))) == 0) {
+        size_t half_len = (size_t)(half_token - buf);
+        size_t remaining = (PIXELSERV_MAX_SERVER_NAME * 4) - half_len;
+        if((cnt = read(fd, buf + half_len, remaining)) == 0) {
 #ifdef DEBUG
              printf("%s: pipe EOF\n", __FUNCTION__);
 #endif
@@ -1596,8 +1598,8 @@ void *cert_generator(void *ptr) {
             continue;
         }
         if (!cnt) continue;
-        if ((size_t)cnt < PIXELSERV_MAX_SERVER_NAME * 4 - strlen(half_token)) {
-            buf[cnt + strlen(half_token)] = '\0';
+        if ((size_t)cnt < remaining) {
+            buf[cnt + half_len] = '\0';
             half_token = buf + PIXELSERV_MAX_SERVER_NAME * 4;
         } else {
             size_t i = 0;
