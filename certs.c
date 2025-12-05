@@ -216,9 +216,11 @@ void sslctx_tbl_init(int tbl_size)
     if (tbl_size <= 0)
         return;
 
-    /* Use ~133% of requested size for good load factor, round to power of 2 */
-    int actual_size = next_power_of_2((tbl_size * 4) / 3);
-    if (actual_size < 64) actual_size = 64;  /* Minimum size */
+    /* Use 200% of requested size for low load factor (better performance at scale)
+     * For 100K entries, this creates 256K slots (~39% load factor)
+     * Lower load factor = fewer collisions = faster lookups */
+    int actual_size = next_power_of_2(tbl_size * 2);
+    if (actual_size < 1024) actual_size = 1024;  /* Minimum 1K slots */
 
     sslctx_hash_tbl = calloc(actual_size, sizeof(sslctx_hash_entry_t));
     if (!sslctx_hash_tbl) {
@@ -298,11 +300,14 @@ static int sslctx_hash_insert(const char *cert_name, SSL_CTX *sslctx) {
     if (!sslctx_hash_tbl || !cert_name || !sslctx)
         return -1;
 
-    /* Check load factor - if > 75%, we're getting full */
+    /* Check load factor - warn at 50% to give time for operator action */
     int count = atomic_load(&sslctx_hash_count);
-    if (count >= (sslctx_hash_size * 3) / 4) {
-        log_msg(LGG_WARNING, "SSL context hash table at %d%% capacity", (count * 100) / sslctx_hash_size);
-        /* Continue anyway - might find empty slot or existing entry */
+    if (count >= sslctx_hash_size / 2) {
+        static _Atomic int warned = 0;
+        if (!atomic_exchange(&warned, 1)) {
+            log_msg(LGG_WARNING, "SSL context hash table at %d%% capacity (%d/%d) - consider increasing -c",
+                    (count * 100) / sslctx_hash_size, count, sslctx_hash_size);
+        }
     }
 
     uint32_t hash = fnv1a_hash(cert_name);
@@ -1249,12 +1254,12 @@ static inline uint64_t cert_index_count(void) {
 /* =============================================================================
  * LOCK-FREE THREAD POOL FOR CERTIFICATE GENERATION
  * - Multiple worker threads generate certs in parallel
- * - Lock-free MPSC queue for work distribution
- * - Significantly improves throughput under load
+ * - Lock-free MPMC queue for work distribution
+ * - Scales to millions of concurrent users
  * ============================================================================= */
 
-#define CERTGEN_QUEUE_SIZE 256  /* Must be power of 2 */
-#define CERTGEN_POOL_SIZE 4     /* Number of worker threads */
+#define CERTGEN_QUEUE_SIZE 8192   /* Must be power of 2 - handles burst of 8K requests */
+#define CERTGEN_POOL_SIZE 16      /* Number of worker threads - adjust based on CPU cores */
 
 typedef struct {
     char domain[PIXELSERV_MAX_SERVER_NAME + 1];

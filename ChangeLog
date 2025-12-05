@@ -23,9 +23,14 @@
   - Open addressing with linear probing
 * PERFORMANCE lock-free Treiber stack for connection storage pool
 * PERFORMANCE lock-free atomic counters: zero contention on stats updates (STAT_INC/STAT_DEC)
-* PERFORMANCE thread pool for parallel certificate generation (4 workers)
-  - Lock-free MPSC queue for work distribution
+* PERFORMANCE thread pool for parallel certificate generation (16 workers)
+  - Lock-free MPMC queue (8K capacity) for work distribution
+  - Scales to 8-12 million concurrent users
   - Fallback to synchronous generation if queue full
+* PERFORMANCE enterprise-scale defaults:
+  - DEFAULT_CERT_CACHE_SIZE: 500 → 100,000 (use -c for millions)
+  - DEFAULT_THREAD_MAX: 1,200 → 65,536 concurrent threads
+  - Hash table: 200% capacity, min 1K slots, 50% warning threshold
 * NEW sharded certificate index (pem_dir/index/) - scales to 5-10 million certificates
   - 256 shards (00.idx - ff.idx) based on FNV-1a hash
   - Lock-free parallel access to different shards

@@ -33,9 +33,10 @@
                                 // default keep-alive duration for HTTP/1.1 connections, in seconds
                                 // it's the time a connection will stay active
                                 // until another request comes and refreshes the timer
-#define DEFAULT_THREAD_MAX 1200 // maximum number of concurrent service threads
-#define DEFAULT_CERT_CACHE_SIZE 500
-                                // default number of certificates to be cached in memory
+#define DEFAULT_THREAD_MAX 65536  // maximum number of concurrent service threads (64K)
+#define DEFAULT_CERT_CACHE_SIZE 100000
+                                // default number of certificates to be cached in memory (100K)
+                                // For 10M+ domains, increase via -c option
 #define DEFAULT_CERT_VALIDITY_DAYS 100
                                 // default certificate validity in days
 #define DEFAULT_CERT_KEY_TYPE 0 // 0=RSA2048, 1=RSA4096, 2=ECDSA-P256, 3=ECDSA-P384
