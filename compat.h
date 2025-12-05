@@ -92,13 +92,22 @@ asprintf(char **strp, const char *fmt, ...)
  * snprintf is POSIX and always available - prefer it for new code.
  * ============================================================================= */
 
-/* Use strlcpy if available (BSD, macOS), otherwise use snprintf */
-#if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__APPLE__)
+/* Use strlcpy if available (BSD, macOS, glibc 2.38+), otherwise provide our own */
 #include <string.h>
-/* strlcpy and strlcat are available */
-#else
-/* glibc doesn't have strlcpy - use snprintf instead in code */
-/* These are only for code that explicitly uses strlcpy */
+
+/* Check for glibc 2.38+ which has strlcpy/strlcat */
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 38))
+#define HAVE_STRLCPY 1
+#define HAVE_STRLCAT 1
+#endif
+
+/* BSD and macOS have strlcpy/strlcat */
+#if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__APPLE__)
+#define HAVE_STRLCPY 1
+#define HAVE_STRLCAT 1
+#endif
+
+/* Provide our own implementation if system doesn't have them */
 #ifndef HAVE_STRLCPY
 static inline size_t
 strlcpy(char *dst, const char *src, size_t size)
@@ -133,7 +142,6 @@ strlcat(char *dst, const char *src, size_t size)
     return dstlen + srclen;
 }
 #endif
-#endif /* BSD strlcpy/strlcat */
 
 /* =============================================================================
  * Clock functions
