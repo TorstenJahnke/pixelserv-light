@@ -720,11 +720,24 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
     snprintf(san_str, SAN_STR_SIZE, "%s:%s", tld_tmp, pem_fn);
     if ((ext = X509V3_EXT_conf_nid(NULL, NULL, NID_subject_alt_name, san_str)) == NULL)
         goto free_all;
-    X509_add_ext(x509, ext, -1);
+    if (X509_add_ext(x509, ext, -1) == 0) {
+        X509_EXTENSION_free(ext);
+        ext = NULL;
+        goto free_all;
+    }
     X509_EXTENSION_free(ext);
+    ext = NULL;  /* Prevent double-free at free_all */
+
     if ((ext = X509V3_EXT_conf_nid(NULL, NULL, NID_ext_key_usage, "TLS Web Server Authentication")) == NULL)
         goto free_all;
-    X509_add_ext(x509, ext, -1);
+    if (X509_add_ext(x509, ext, -1) == 0) {
+        X509_EXTENSION_free(ext);
+        ext = NULL;
+        goto free_all;
+    }
+    X509_EXTENSION_free(ext);
+    ext = NULL;  /* Prevent double-free at free_all */
+
     X509_set_pubkey(x509, key);
     X509_sign_ctx(x509, p_ctx);
 #ifdef DEBUG
@@ -1682,7 +1695,9 @@ static int tls_servername_cb(SSL *ssl, int *ad, void *arg) {
     else if (strlen(cbarg->servername))
         srv_name = cbarg->servername;
     else {
+#ifdef DEBUG
         log_msg(LGG_WARNING, "SNI failed. server name and ip empty.");
+#endif
         rv = CB_ERR;
         goto quit_cb;
     }
@@ -1713,7 +1728,9 @@ static int tls_servername_cb(SSL *ssl, int *ad, void *arg) {
     printf("PEM filename: %s\n",full_pem_path);
 #endif
     if (len > PIXELSERV_MAX_PATH) {
+#ifdef DEBUG
         log_msg(LGG_ERR, "%s: buffer overflow. %s", __FUNCTION__, full_pem_path);
+#endif
         rv = CB_ERR;
         goto quit_cb;
     }
@@ -1732,7 +1749,9 @@ static int tls_servername_cb(SSL *ssl, int *ad, void *arg) {
         }
         /* Certificate expired - delete from cache and regenerate */
         cbarg->status = SSL_ERR;
+#ifdef DEBUG
         log_msg(LGG_WARNING, "Expired certificate %s", pem_file);
+#endif
         sslctx_hash_delete(pem_file);
         remove(full_pem_path);
         goto submit_missing_cert;
@@ -1742,21 +1761,28 @@ static int tls_servername_cb(SSL *ssl, int *ad, void *arg) {
     if (stat(full_pem_path, &st) != 0) {
         int fd;
         cbarg->status = SSL_MISS;
+#ifdef DEBUG
         log_msg(LGG_WARNING, "%s %s missing", srv_name, pem_file);
+#endif
 
 submit_missing_cert:
 
-        if ((fd = open(PIXEL_CERT_PIPE, O_WRONLY)) < 0)
+        if ((fd = open(PIXEL_CERT_PIPE, O_WRONLY)) < 0) {
+#ifdef DEBUG
             log_msg(LGG_ERR, "%s: failed to open pipe: %s", __FUNCTION__, strerror(errno));
-        else {
+#endif
+        } else {
             size_t i = 0;
             for(i=0; i< strlen(pem_file); i++)
                 *(full_pem_path + i) = *(pem_file + i);
             *(full_pem_path + i) = ':';
             *(full_pem_path + i + 1) = '\0';
 
-            if (write(fd, full_pem_path, strlen(full_pem_path)) < 0)
+            if (write(fd, full_pem_path, strlen(full_pem_path)) < 0) {
+#ifdef DEBUG
                 log_msg(LGG_ERR, "%s: failed to write pipe: %s", __FUNCTION__, strerror(errno));
+#endif
+            }
             close(fd);
         }
 
@@ -1767,7 +1793,9 @@ submit_missing_cert:
     /* Load cert from disk - lock-free, multiple threads can do this */
     SSL_CTX *sslctx = create_child_sslctx(full_pem_path, cbarg->cachain);
     if (sslctx == NULL) {
+#ifdef DEBUG
         log_msg(LGG_ERR, "%s: fail to create sslctx for %s", __FUNCTION__, pem_file);
+#endif
         cbarg->status = SSL_ERR;
         rv = CB_ERR;
         goto quit_cb;
@@ -1777,7 +1805,9 @@ submit_missing_cert:
     if (X509_cmp_time(X509_get_notAfter(SSL_get_certificate(ssl)), NULL) < 0) {
         /* Certificate expired - regenerate */
         cbarg->status = SSL_ERR;
+#ifdef DEBUG
         log_msg(LGG_WARNING, "Expired certificate %s", pem_file);
+#endif
         SSL_CTX_free(sslctx);
         remove(full_pem_path);
         goto submit_missing_cert;
@@ -1787,7 +1817,9 @@ submit_missing_cert:
      * If same cert, hash_insert handles deduplication (returns 1 = already exists) */
     int insert_rv = sslctx_hash_insert(pem_file, sslctx);
     if (insert_rv < 0) {
+#ifdef DEBUG
         log_msg(LGG_WARNING, "%s: hash table full, using uncached sslctx for %s", __FUNCTION__, pem_file);
+#endif
         /* Continue anyway - sslctx is valid, just not cached */
     }
     cbarg->status = SSL_HIT;
