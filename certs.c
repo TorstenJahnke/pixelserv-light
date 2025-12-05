@@ -1023,6 +1023,10 @@ typedef struct {
     int key_type;  /* 0=RSA2048, 1=RSA4096, 2=ECDSA-P256, 3=ECDSA-P384 */
 } cert_index_entry_t;
 
+/* Forward declarations for index functions */
+static cert_index_entry_t* cert_index_load_shard(const char *pem_dir, int shard, int *count);
+static int cert_index_rebuild(const char *pem_dir);
+
 /* Shard statistics (atomic) */
 static _Atomic uint64_t cert_index_total_entries = 0;
 static char *cert_index_base_path = NULL;
@@ -1191,6 +1195,7 @@ static int cert_index_init(const char *pem_dir) {
     /* Create main index directory */
     snprintf(path, PIXELSERV_MAX_PATH, "%s/%s", pem_dir, CERT_INDEX_DIR);
 
+    int need_rebuild = 0;
     if (stat(path, &st) != 0) {
         if (mkdir(path, 0755) != 0) {
             log_msg(LGG_ERR, "%s: failed to create index dir %s: %s",
@@ -1199,6 +1204,7 @@ static int cert_index_init(const char *pem_dir) {
         }
         log_msg(LGG_NOTICE, "Created sharded certificate index: %s (%d shards)",
                 path, CERT_INDEX_SHARDS);
+        need_rebuild = 1;
     } else if (!S_ISDIR(st.st_mode)) {
         log_msg(LGG_ERR, "%s: %s exists but is not a directory", __FUNCTION__, path);
         return -1;
@@ -1207,6 +1213,11 @@ static int cert_index_init(const char *pem_dir) {
     /* Store base path for later use */
     if (cert_index_base_path == NULL) {
         cert_index_base_path = strdup(pem_dir);
+    }
+
+    /* Rebuild index from existing certificates if needed */
+    if (need_rebuild) {
+        cert_index_rebuild(pem_dir);
     }
 
     /* First pass: count total entries to size memory index appropriately */
@@ -1229,25 +1240,18 @@ static int cert_index_init(const char *pem_dir) {
         return -1;
     }
 
-    /* Second pass: load all entries into memory index */
+    /* Second pass: load all entries into memory index using cert_index_load_shard */
     if (total > 0) {
         log_msg(LGG_NOTICE, "Loading %lu certificates into memory index...", (unsigned long)total);
 
         for (int s = 0; s < CERT_INDEX_SHARDS; s++) {
-            cert_index_shard_path(pem_dir, s, path, PIXELSERV_MAX_PATH);
-            FILE *fp = fopen(path, "r");
-            if (fp) {
-                char line[PIXELSERV_MAX_SERVER_NAME + 64];
-                while (fgets(line, sizeof(line), fp)) {
-                    char domain[PIXELSERV_MAX_SERVER_NAME + 1];
-                    long created, expires;
-                    int key_type;
-
-                    if (sscanf(line, "%255s\t%ld\t%ld\t%d", domain, &created, &expires, &key_type) >= 3) {
-                        cert_index_mem_insert(domain, (time_t)expires);
-                    }
+            int shard_count = 0;
+            cert_index_entry_t *entries = cert_index_load_shard(pem_dir, s, &shard_count);
+            if (entries) {
+                for (int i = 0; i < shard_count; i++) {
+                    cert_index_mem_insert(entries[i].domain, entries[i].expires);
                 }
-                fclose(fp);
+                free(entries);
             }
         }
 
@@ -1506,7 +1510,7 @@ static void *certgen_worker(void *arg) {
         }
 
         /* Check if cert already exists - O(1) memory lookup */
-        if (!cert_index_mem_lookup(domain)) {
+        if (!cert_index_exists(certgen_ctx->pem_dir, domain)) {
             /* Cert doesn't exist in index - generate it */
             char domain_copy[PIXELSERV_MAX_SERVER_NAME + 1];
             strncpy(domain_copy, domain, PIXELSERV_MAX_SERVER_NAME);
