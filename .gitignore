@@ -29,3 +29,14 @@ configure
 depcomp
 install-sh
 missing
+config.guess
+config.sub
+config.h
+config.log
+config.status
+stamp-h1
+Makefile
+.deps/
+
+# Built binary
+pixelserv-tls
