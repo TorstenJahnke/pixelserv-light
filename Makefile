@@ -100,8 +100,8 @@ endif
 
 # Tongsuo (SM2/SM3/SM4 support) - always static linked
 ifdef TONGSUO_PATH
-    # Auto-detect lib vs lib64
-    TONGSUO_LIBDIR := $(shell [ -d $(TONGSUO_PATH)/lib64 ] && echo lib64 || echo lib)
+    # Auto-detect lib vs lib64, allow override via TONGSUO_LIBDIR=
+    TONGSUO_LIBDIR ?= $(shell [ -d $(TONGSUO_PATH)/lib64 ] && echo lib64 || echo lib)
     SSL_CFLAGS  := -I$(TONGSUO_PATH)/include -DENABLE_TONGCHOU -DHAVE_SM2 -DHAVE_SM3 -DHAVE_SM4
     SSL_LDFLAGS := -L$(TONGSUO_PATH)/$(TONGSUO_LIBDIR)
     SSL_LIBS    := $(TONGSUO_PATH)/$(TONGSUO_LIBDIR)/libssl.a $(TONGSUO_PATH)/$(TONGSUO_LIBDIR)/libcrypto.a -ldl
@@ -111,8 +111,8 @@ endif
 # Custom OpenSSL path
 ifdef OPENSSL_PATH
 ifndef TONGSUO_PATH
-    # Auto-detect lib vs lib64
-    OPENSSL_LIBDIR := $(shell [ -d $(OPENSSL_PATH)/lib64 ] && echo lib64 || echo lib)
+    # Auto-detect lib vs lib64, allow override via OPENSSL_LIBDIR=
+    OPENSSL_LIBDIR ?= $(shell [ -d $(OPENSSL_PATH)/lib64 ] && echo lib64 || echo lib)
     SSL_CFLAGS  := -I$(OPENSSL_PATH)/include
     SSL_LDFLAGS := -L$(OPENSSL_PATH)/$(OPENSSL_LIBDIR)
     ifeq ($(STATIC_SSL),1)
