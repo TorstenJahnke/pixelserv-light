@@ -1,3 +1,32 @@
+2025-12-05 v2.5.0 (Torsten Jahnke)
+
+* NEW support for SM2/SM3/SM4 (Tongchou/国密) Chinese national cryptography ciphers
+* NEW BSI TR-02102-2 / NIS2 compliance mode with Brainpool curves and X448 support
+* NEW configurable certificate key types: RSA2048, RSA4096, ECDSA P-256, ECDSA P-384
+* NEW CLI option `-K KEY_TYPE` to select certificate key algorithm (0-3)
+* NEW CLI option `-d CERT_DAYS` to configure certificate validity (default: 100, max: 825)
+* NEW CA files separated into pem_dir/rootCA/ subdirectory (protects CA from bulk cert deletion)
+* NEW flexible CA hierarchy with search order:
+  - Primary: rootCA/rootca.crt + rootCA/rootca.key (Root CA)
+  - Secondary: rootCA/subca.crt + rootCA/subca.key (Subordinate CA for signing)
+  - Cross-signed: rootCA/subca.cs.crt (optional, for chain building)
+  - Legacy fallback: rootCA/ca.crt + rootCA/ca.key (backwards compatible)
+  - Passphrase files: rootCA/<keyname>.key.passphrase
+* NEW comprehensive cipher suite configuration with AEAD-first ordering
+* NEW configure options: --disable-tongchou, --enable-bsi-strict
+* CHANGED default certificate validity from 825 to 100 days
+* CHANGED certificate writing order to Key → Cert (industry standard)
+* CHANGED improved OpenSSL 3.0 compatibility (EVP_RSA_gen, EVP_EC_gen)
+* PERFORMANCE RW-locks for SSL context table: concurrent read access, no reader blocking
+* PERFORMANCE lock-free atomic counters: zero contention on stats updates (STAT_INC/STAT_DEC)
+* PERFORMANCE double-check locking prevents redundant certificate generation under high load
+* FIXED thread safety: RW-lock for SSL context table prevents race conditions
+* FIXED atomic operations for all stats counters (lock-free STAT_INC/STAT_DEC)
+* FIXED double-check locking in sslctx_tbl_cache() for concurrent cert loading
+* FIXED BIO NULL pointer check crash in certificate loading
+* FIXED removed deprecated ERR_GET_FUNC for OpenSSL 3.0+
+* FIXED log_msg format string bug (missing __FUNCTION__)
+
 2019-12-13 v2.3.1
 
 * NEW check and purge expired certs on-the-fly. Generate new ones to replace the expired automatically.

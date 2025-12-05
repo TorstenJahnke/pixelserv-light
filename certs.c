@@ -38,6 +38,7 @@ static unsigned int  sslctx_tbl_last_flush;
 static void **conn_stor;
 static int conn_stor_last = -1, conn_stor_max = -1;
 static pthread_mutex_t cslock;
+static pthread_rwlock_t sslctx_tbl_rwlock;
 
 #define SSLCTX_TBL_ptr(h)         ((sslctx_cache_struct *)(sslctx_tbl + h))
 #define SSLCTX_TBL_get(h, k)      SSLCTX_TBL_ptr(h)->k
@@ -125,16 +126,20 @@ void sslctx_tbl_init(int tbl_size)
         sslctx_tbl_size = tbl_size;
         sslctx_tbl_cnt_hit = sslctx_tbl_cnt_miss = sslctx_tbl_cnt_purge = sslctx_tbl_last_flush = 0;
         memset(sslctx_tbl, 0, tbl_size * sizeof(sslctx_cache_struct));
+        pthread_rwlock_init(&sslctx_tbl_rwlock, NULL);
     }
 }
 
 void sslctx_tbl_cleanup()
 {
     int idx;
+    pthread_rwlock_wrlock(&sslctx_tbl_rwlock);
     for (idx = 0; idx < sslctx_tbl_end; idx++) {
         free(SSLCTX_TBL_get(idx, cert_name));
         SSL_CTX_free(SSLCTX_TBL_get(idx, sslctx));
     }
+    pthread_rwlock_unlock(&sslctx_tbl_rwlock);
+    pthread_rwlock_destroy(&sslctx_tbl_rwlock);
 }
 
 static int cmp_sslctx_reuse_count(const void *p1, const void *p2)
@@ -148,6 +153,7 @@ static int cmp_sslctx_certname(const void *k, const void *p)
     return strcmp(((sslctx_cache_struct *)k)->cert_name, ((sslctx_cache_struct *)p)->cert_name);
 }
 
+/* NOTE: Called during single-threaded startup only - no locking needed */
 void sslctx_tbl_load(const char* pem_dir, const STACK_OF(X509_INFO) *cachain)
 {
     FILE *fp;
@@ -184,6 +190,8 @@ quit_load:
     free(line);
 }
 
+/* NOTE: Called from signal handler during shutdown - async-signal-unsafe
+ * but acceptable since followed by exit() */
 void sslctx_tbl_save(const char* pem_dir)
 {
     #define RATIO_TO_SAVE 1
@@ -258,6 +266,8 @@ static int sslctx_tbl_lookup(char* cert_name, int* found_idx, int* ins_idx)
         return -1;
     }
 
+    pthread_rwlock_wrlock(&sslctx_tbl_rwlock);
+
     sslctx_cache_struct key, *found;
     key.cert_name = cert_name;
     found = bsearch(&key, SSLCTX_TBL_ptr(0), sslctx_tbl_end, sizeof(sslctx_cache_struct), cmp_sslctx_certname);
@@ -281,6 +291,8 @@ static int sslctx_tbl_lookup(char* cert_name, int* found_idx, int* ins_idx)
         }
         *ins_idx = purge_idx;
     }
+
+    pthread_rwlock_unlock(&sslctx_tbl_rwlock);
     return 0;
 }
 
@@ -319,17 +331,45 @@ static int sslctx_tbl_insert(const char *cert_name, SSL_CTX *sslctx, int ins_idx
 }
 
 static int sslctx_tbl_cache(const char *cert_name, SSL_CTX *sslctx, int ins_idx)
-{   int ret = -1;
+{
+    int ret = -1;
+
+    pthread_rwlock_wrlock(&sslctx_tbl_rwlock);
+
+    /* Double-check: another thread might have cached this cert while we loaded it */
+    sslctx_cache_struct key, *found;
+    key.cert_name = (char *)cert_name;
+    found = bsearch(&key, SSLCTX_TBL_ptr(0), sslctx_tbl_end, sizeof(sslctx_cache_struct), cmp_sslctx_certname);
+
+    if (found != NULL) {
+        /* Already cached by another thread - update stats and discard our copy */
+        found->reuse_count++;
+        found->last_use = process_uptime();
+        pthread_rwlock_unlock(&sslctx_tbl_rwlock);
+        SSL_CTX_free(sslctx);  /* Free duplicate */
+        return 0;
+    }
+
     if (sslctx_tbl_insert(cert_name, sslctx, ins_idx) == 0) {
         qsort(SSLCTX_TBL_ptr(0), sslctx_tbl_end, sizeof(sslctx_cache_struct), cmp_sslctx_certname);
         ret = 0;
     }
+
+    pthread_rwlock_unlock(&sslctx_tbl_rwlock);
     return ret;
 }
 
 static int sslctx_tbl_purge(int idx) {
     if (idx < 0 || idx >= sslctx_tbl_end || sslctx_tbl_end <= 0)
         return -1;
+
+    pthread_rwlock_wrlock(&sslctx_tbl_rwlock);
+
+    /* Re-validate idx after acquiring lock */
+    if (idx >= sslctx_tbl_end) {
+        pthread_rwlock_unlock(&sslctx_tbl_rwlock);
+        return -1;
+    }
 
     if (SSLCTX_TBL_get(idx, cert_name))
         free(SSLCTX_TBL_get(idx, cert_name));
@@ -343,6 +383,7 @@ static int sslctx_tbl_purge(int idx) {
         memset(SSLCTX_TBL_ptr(sslctx_tbl_end), 0, sizeof(sslctx_cache_struct));
     }
 
+    pthread_rwlock_unlock(&sslctx_tbl_rwlock);
     return 0;
 }
 
@@ -557,13 +598,14 @@ static int pem_passwd_cb(char *buf, int size, int rwflag, void *u) {
     char *fname = NULL;
     passwd_cb_arg_t *arg = (passwd_cb_arg_t *)u;
 
-    if (asprintf(&fname, "%s/%s.key.passphrase", arg->pem_dir, arg->key_name) < 0)
+    /* Try pem_dir/rootCA/<key_name>.key.passphrase first */
+    if (asprintf(&fname, "%s/rootCA/%s.key.passphrase", arg->pem_dir, arg->key_name) < 0)
         goto quit_cb;
 
     if ((fp = open(fname, O_RDONLY)) < 0) {
-        /* Try legacy ca.key.passphrase for backwards compatibility */
+        /* Try legacy pem_dir/rootCA/ca.key.passphrase */
         free(fname);
-        if (asprintf(&fname, "%s/ca.key.passphrase", arg->pem_dir) < 0)
+        if (asprintf(&fname, "%s/rootCA/ca.key.passphrase", arg->pem_dir) < 0)
             goto quit_cb;
         if ((fp = open(fname, O_RDONLY)) < 0)
             log_msg(LGG_DEBUG, "%s: no passphrase file found", __FUNCTION__);
@@ -636,16 +678,16 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     passwd_arg.pem_dir = pem_dir;
 
     /*
-     * New CA hierarchy:
-     * - rootca.crt + rootca.key (required, at least one CA)
-     * - subca.crt + subca.key (optional, used for signing if present)
-     * - subca.cs.crt (optional, cross-signed certificate for chain)
+     * New CA hierarchy (all files under pem_dir/rootCA/):
+     * - rootCA/rootca.crt + rootCA/rootca.key (required, at least one CA)
+     * - rootCA/subca.crt + rootCA/subca.key (optional, used for signing if present)
+     * - rootCA/subca.cs.crt (optional, cross-signed certificate for chain)
      *
-     * Fallback to legacy ca.crt + ca.key if new files not found
+     * Fallback to legacy rootCA/ca.crt + rootCA/ca.key if new files not found
      */
 
     /* Try to load SubCA first (if exists, this is the signing CA) */
-    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/subca.crt", pem_dir);
+    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/subca.crt", pem_dir);
     fp = fopen(cert_file, "r");
     if (fp) {
         issuer_cert = X509_new();
@@ -662,7 +704,7 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
 
     /* If no SubCA, try RootCA */
     if (!use_subca) {
-        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootca.crt", pem_dir);
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/rootca.crt", pem_dir);
         fp = fopen(cert_file, "r");
         if (fp) {
             issuer_cert = X509_new();
@@ -679,7 +721,7 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
 
     /* Fallback to legacy ca.crt */
     if (!issuer_cert) {
-        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/ca.crt", pem_dir);
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/ca.crt", pem_dir);
         fp = fopen(cert_file, "r");
         if (fp) {
             issuer_cert = X509_new();
@@ -695,7 +737,7 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     }
 
     if (!issuer_cert) {
-        log_msg(LGG_ERR, "%s: no CA certificate found (tried subca.crt, rootca.crt, ca.crt)", __FUNCTION__);
+        log_msg(LGG_ERR, "%s: no CA certificate found in %s/rootCA/ (tried subca.crt, rootca.crt, ca.crt)", __FUNCTION__, pem_dir);
         return;
     }
 
@@ -705,19 +747,19 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     /* Build CA chain: SubCA (or SubCA cross-signed) + RootCA */
     if (use_subca) {
         /* Try cross-signed SubCA first, fall back to regular SubCA */
-        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/subca.cs.crt", pem_dir);
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/subca.cs.crt", pem_dir);
         if (!load_cert_to_chain(&ct->cachain, cert_file)) {
-            snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/subca.crt", pem_dir);
+            snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/subca.crt", pem_dir);
             load_cert_to_chain(&ct->cachain, cert_file);
         }
         /* Add RootCA to chain */
-        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootca.crt", pem_dir);
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/rootca.crt", pem_dir);
         load_cert_to_chain(&ct->cachain, cert_file);
     } else {
         /* Just RootCA or legacy ca.crt */
-        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootca.crt", pem_dir);
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/rootca.crt", pem_dir);
         if (!load_cert_to_chain(&ct->cachain, cert_file)) {
-            snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/ca.crt", pem_dir);
+            snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/ca.crt", pem_dir);
             load_cert_to_chain(&ct->cachain, cert_file);
         }
     }
@@ -728,7 +770,7 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     /* Load private key - must match the signing certificate */
     if (use_subca) {
         /* SubCA mode: MUST have subca.key */
-        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/subca.key", pem_dir);
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/subca.key", pem_dir);
         passwd_arg.key_name = "subca";
         fp = fopen(cert_file, "r");
         if (fp && PEM_read_PrivateKey(fp, &ct->privkey, pem_passwd_cb, &passwd_arg)) {
@@ -745,7 +787,7 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     }
 
     /* RootCA mode: try rootca.key first */
-    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootca.key", pem_dir);
+    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/rootca.key", pem_dir);
     passwd_arg.key_name = "rootca";
     fp = fopen(cert_file, "r");
     if (fp && PEM_read_PrivateKey(fp, &ct->privkey, pem_passwd_cb, &passwd_arg)) {
@@ -756,7 +798,7 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     if (fp) fclose(fp);
 
     /* Fallback to legacy ca.key */
-    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/ca.key", pem_dir);
+    snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/ca.key", pem_dir);
     passwd_arg.key_name = "ca";
     fp = fopen(cert_file, "r");
     if (!fp || !PEM_read_PrivateKey(fp, &ct->privkey, pem_passwd_cb, &passwd_arg))
