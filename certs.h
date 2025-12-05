@@ -381,6 +381,7 @@ void conn_stor_init(int slots);
 void conn_stor_relinq(conn_tlstor_struct *p);
 conn_tlstor_struct* conn_stor_acquire();
 void conn_stor_flush();
+void certgen_pool_shutdown(void);
 #ifdef TLS1_3_VERSION
 int tls_clienthello_cb(SSL *ssl, int *ad, void *arg);
 char* read_tls_early_data(SSL *ssl, int *err);

@@ -886,6 +886,7 @@ start_service_thread:
 
   pthread_cancel(certgen_thread);
   pthread_join(certgen_thread, NULL);
+  certgen_pool_shutdown();  /* Shutdown cert generation worker threads */
 
 quit_main:
   SSL_CTX_free(sslctx);
