@@ -19,31 +19,35 @@
 #define PIXELSERV_MAX_PATH 1024
 #define PIXELSERV_MAX_SERVER_NAME 255
 
-/* TLS 1.2 Cipher List - BSI TR-02102-2 and NIS2 Compliant (2024+)
+/* =============================================================================
+   COMPREHENSIVE TLS CIPHER SUITE COLLECTION
+   Maximum compatibility - supports clients from Windows XP to modern browsers
+   ============================================================================= */
 
-   BSI TR-02102-2 Requirements:
-   - Only PFS (Perfect Forward Secrecy) cipher suites: ECDHE or DHE
-   - AES-GCM or AES-CBC with SHA-256/SHA-384 (no SHA-1)
-   - Key sizes: AES-128 or AES-256
-   - CHACHA20-POLY1305 accepted as alternative to AES-GCM
-
-   Priority order:
-   1. AEAD ciphers (GCM, CHACHA20) - preferred
-   2. CBC ciphers with SHA-256/384 - BSI compliant fallback
-   3. Legacy ciphers (SHA-1, no PFS) - only for compatibility, not BSI compliant
-
-   NIS2 Directive: Requires state-of-the-art encryption per BSI/ENISA guidelines */
-
-/* BSI TR-02102-2 compliant ciphers (recommended) */
-#define PIXELSERV_CIPHER_LIST_BSI \
+/* --- TIER 1: Modern AEAD Ciphers (TLS 1.2) - Highest Priority --- */
+#define PIXELSERV_CIPHERS_AEAD_ECDHE \
   "ECDHE-ECDSA-AES256-GCM-SHA384:" \
   "ECDHE-RSA-AES256-GCM-SHA384:" \
-  "ECDHE-ECDSA-CHACHA20-POLY1305:" \
-  "ECDHE-RSA-CHACHA20-POLY1305:" \
   "ECDHE-ECDSA-AES128-GCM-SHA256:" \
   "ECDHE-RSA-AES128-GCM-SHA256:" \
+  "ECDHE-ECDSA-CHACHA20-POLY1305:" \
+  "ECDHE-RSA-CHACHA20-POLY1305:" \
+  "ECDHE-ECDSA-AES256-CCM:" \
+  "ECDHE-ECDSA-AES128-CCM:" \
+  "ECDHE-ECDSA-AES256-CCM8:" \
+  "ECDHE-ECDSA-AES128-CCM8"
+
+#define PIXELSERV_CIPHERS_AEAD_DHE \
   "DHE-RSA-AES256-GCM-SHA384:" \
   "DHE-RSA-AES128-GCM-SHA256:" \
+  "DHE-RSA-CHACHA20-POLY1305:" \
+  "DHE-RSA-AES256-CCM:" \
+  "DHE-RSA-AES128-CCM:" \
+  "DHE-RSA-AES256-CCM8:" \
+  "DHE-RSA-AES128-CCM8"
+
+/* --- TIER 2: CBC Ciphers with SHA-256/384 (BSI compliant) --- */
+#define PIXELSERV_CIPHERS_CBC_SHA256 \
   "ECDHE-ECDSA-AES256-SHA384:" \
   "ECDHE-RSA-AES256-SHA384:" \
   "ECDHE-ECDSA-AES128-SHA256:" \
@@ -51,65 +55,172 @@
   "DHE-RSA-AES256-SHA256:" \
   "DHE-RSA-AES128-SHA256"
 
-/* Legacy ciphers for older client compatibility (NOT BSI/NIS2 compliant) */
-#define PIXELSERV_CIPHER_LIST_LEGACY \
+/* --- TIER 3: CBC Ciphers with SHA-1 (Legacy PFS) --- */
+#define PIXELSERV_CIPHERS_CBC_SHA1 \
+  "ECDHE-ECDSA-AES256-SHA:" \
+  "ECDHE-RSA-AES256-SHA:" \
+  "ECDHE-ECDSA-AES128-SHA:" \
   "ECDHE-RSA-AES128-SHA:" \
-  "DHE-RSA-AES128-SHA:" \
-  "AES128-GCM-SHA256:" \
+  "DHE-RSA-AES256-SHA:" \
+  "DHE-RSA-AES128-SHA"
+
+/* --- TIER 4: Non-PFS AEAD (Static RSA with GCM) --- */
+#define PIXELSERV_CIPHERS_STATIC_AEAD \
   "AES256-GCM-SHA384:" \
+  "AES128-GCM-SHA256:" \
+  "AES256-CCM:" \
+  "AES128-CCM:" \
+  "AES256-CCM8:" \
+  "AES128-CCM8"
+
+/* --- TIER 5: Non-PFS CBC with SHA-256 --- */
+#define PIXELSERV_CIPHERS_STATIC_SHA256 \
+  "AES256-SHA256:" \
+  "AES128-SHA256"
+
+/* --- TIER 6: Non-PFS CBC with SHA-1 (Windows 7, Android 4.x) --- */
+#define PIXELSERV_CIPHERS_STATIC_SHA1 \
+  "AES256-SHA:" \
   "AES128-SHA"
 
-/* Combined list: BSI-compliant first, then legacy for compatibility */
+/* --- TIER 7: ARIA Ciphers (Korean Standard KS X 1213) --- */
+#define PIXELSERV_CIPHERS_ARIA \
+  "ECDHE-ECDSA-ARIA256-GCM-SHA384:" \
+  "ECDHE-RSA-ARIA256-GCM-SHA384:" \
+  "ECDHE-ECDSA-ARIA128-GCM-SHA256:" \
+  "ECDHE-RSA-ARIA128-GCM-SHA256:" \
+  "DHE-RSA-ARIA256-GCM-SHA384:" \
+  "DHE-RSA-ARIA128-GCM-SHA256:" \
+  "ARIA256-GCM-SHA384:" \
+  "ARIA128-GCM-SHA256:" \
+  "ECDHE-ECDSA-ARIA256-SHA384:" \
+  "ECDHE-RSA-ARIA256-SHA384:" \
+  "ECDHE-ECDSA-ARIA128-SHA256:" \
+  "ECDHE-RSA-ARIA128-SHA256:" \
+  "DHE-RSA-ARIA256-SHA384:" \
+  "DHE-RSA-ARIA128-SHA256:" \
+  "ARIA256-SHA384:" \
+  "ARIA128-SHA256"
+
+/* --- TIER 8: Camellia Ciphers (Japanese/ISO Standard) --- */
+#define PIXELSERV_CIPHERS_CAMELLIA \
+  "ECDHE-ECDSA-CAMELLIA256-GCM-SHA384:" \
+  "ECDHE-RSA-CAMELLIA256-GCM-SHA384:" \
+  "ECDHE-ECDSA-CAMELLIA128-GCM-SHA256:" \
+  "ECDHE-RSA-CAMELLIA128-GCM-SHA256:" \
+  "DHE-RSA-CAMELLIA256-GCM-SHA384:" \
+  "DHE-RSA-CAMELLIA128-GCM-SHA256:" \
+  "CAMELLIA256-GCM-SHA384:" \
+  "CAMELLIA128-GCM-SHA256:" \
+  "ECDHE-ECDSA-CAMELLIA256-SHA384:" \
+  "ECDHE-RSA-CAMELLIA256-SHA384:" \
+  "ECDHE-ECDSA-CAMELLIA128-SHA256:" \
+  "ECDHE-RSA-CAMELLIA128-SHA256:" \
+  "DHE-RSA-CAMELLIA256-SHA384:" \
+  "DHE-RSA-CAMELLIA128-SHA256:" \
+  "DHE-RSA-CAMELLIA256-SHA:" \
+  "DHE-RSA-CAMELLIA128-SHA:" \
+  "CAMELLIA256-SHA384:" \
+  "CAMELLIA128-SHA256:" \
+  "CAMELLIA256-SHA:" \
+  "CAMELLIA128-SHA"
+
+/* --- TIER 9: SEED Cipher (Korean Standard KISA) --- */
+#define PIXELSERV_CIPHERS_SEED \
+  "DHE-RSA-SEED-SHA:" \
+  "SEED-SHA"
+
+/* --- TIER 10: DSS/DSA Ciphers --- */
+#define PIXELSERV_CIPHERS_DSS \
+  "DHE-DSS-AES256-GCM-SHA384:" \
+  "DHE-DSS-AES128-GCM-SHA256:" \
+  "DHE-DSS-AES256-SHA256:" \
+  "DHE-DSS-AES128-SHA256:" \
+  "DHE-DSS-AES256-SHA:" \
+  "DHE-DSS-AES128-SHA"
+
+/* --- TIER 11: 3DES (Very old clients - Windows XP, IE6) --- */
+#define PIXELSERV_CIPHERS_3DES \
+  "ECDHE-RSA-DES-CBC3-SHA:" \
+  "ECDHE-ECDSA-DES-CBC3-SHA:" \
+  "DHE-RSA-DES-CBC3-SHA:" \
+  "DES-CBC3-SHA"
+
+/* --- Combined Lists --- */
+
+/* BSI TR-02102-2 / NIS2 compliant (recommended for EU) */
+#define PIXELSERV_CIPHER_LIST_BSI \
+  PIXELSERV_CIPHERS_AEAD_ECDHE ":" \
+  PIXELSERV_CIPHERS_AEAD_DHE ":" \
+  PIXELSERV_CIPHERS_CBC_SHA256
+
+/* Standard list with legacy support */
+#define PIXELSERV_CIPHER_LIST_LEGACY \
+  PIXELSERV_CIPHERS_CBC_SHA1 ":" \
+  PIXELSERV_CIPHERS_STATIC_AEAD ":" \
+  PIXELSERV_CIPHERS_STATIC_SHA256 ":" \
+  PIXELSERV_CIPHERS_STATIC_SHA1
+
+/* International ciphers (ARIA, Camellia, SEED) */
+#define PIXELSERV_CIPHER_LIST_INTL \
+  PIXELSERV_CIPHERS_ARIA ":" \
+  PIXELSERV_CIPHERS_CAMELLIA ":" \
+  PIXELSERV_CIPHERS_SEED
+
+/* DSS and 3DES for very old clients */
+#define PIXELSERV_CIPHER_LIST_COMPAT \
+  PIXELSERV_CIPHERS_DSS ":" \
+  PIXELSERV_CIPHERS_3DES
+
+/* DEFAULT: BSI + Legacy (covers Windows 7+, Android 4+, iOS 5+) */
 #define PIXELSERV_CIPHER_LIST \
-  PIXELSERV_CIPHER_LIST_BSI ":" PIXELSERV_CIPHER_LIST_LEGACY
+  PIXELSERV_CIPHER_LIST_BSI ":" \
+  PIXELSERV_CIPHER_LIST_LEGACY
+
+/* FULL: Everything including international ciphers */
+#define PIXELSERV_CIPHER_LIST_ALL \
+  PIXELSERV_CIPHER_LIST ":" \
+  PIXELSERV_CIPHER_LIST_INTL ":" \
+  PIXELSERV_CIPHER_LIST_COMPAT
 
 /* Strict BSI-only mode (no legacy ciphers) */
 #define PIXELSERV_CIPHER_LIST_STRICT PIXELSERV_CIPHER_LIST_BSI
 
-/* TLS 1.3 Cipher Suites (RFC 8446) - BSI TR-02102-2 compliant
-   All TLS 1.3 ciphers use AEAD and are BSI/NIS2 compliant
-   Note: CCM_8 has shorter auth tag, excluded for strict BSI compliance */
+/* =============================================================================
+   TLS 1.3 CIPHER SUITES (RFC 8446)
+   ============================================================================= */
+
+/* Standard TLS 1.3 ciphers */
 #define PIXELSERV_TLSV1_3_CIPHERS \
   "TLS_AES_256_GCM_SHA384:" \
   "TLS_AES_128_GCM_SHA256:" \
   "TLS_CHACHA20_POLY1305_SHA256:" \
-  "TLS_AES_128_CCM_SHA256"
-
-/* TLS 1.3 with CCM_8 (shorter auth tag - may not meet strict BSI requirements) */
-#define PIXELSERV_TLSV1_3_CIPHERS_EXTENDED \
-  PIXELSERV_TLSV1_3_CIPHERS ":" \
+  "TLS_AES_128_CCM_SHA256:" \
   "TLS_AES_128_CCM_8_SHA256"
 
-/* SM2/SM3/SM4 Cipher Suites for Tongchou (Chinese GM/T Standards)
+/* =============================================================================
+   SM2/SM3/SM4 CIPHER SUITES - Tongchou (Chinese GM/T Standards)
    Requires OpenSSL 1.1.1+ compiled with enable-sm2 enable-sm3 enable-sm4
-   SM2: Elliptic Curve (similar to ECDSA/ECDH)
-   SM3: Hash function (256-bit, similar to SHA-256)
-   SM4: Block cipher (128-bit, similar to AES-128)
-
-   Detection priority:
-   1. DISABLE_TONGCHOU - explicitly disabled via --disable-tongchou
-   2. HAVE_TONGCHOU - autoconf detected full SM2/SM3/SM4 support
-   3. HAVE_SM4 - autoconf detected at least SM4 support
-   4. OPENSSL_NO_SM4 - OpenSSL compile-time flag (fallback) */
+   ============================================================================= */
 
 #if defined(DISABLE_TONGCHOU)
-   /* Tongchou explicitly disabled */
 #  define PIXELSERV_SM_CIPHERS ""
 #  define PIXELSERV_TLSV1_3_SM_CIPHERS ""
 #  define PIXELSERV_HAS_TONGCHOU 0
 #elif defined(HAVE_TONGCHOU) || defined(HAVE_SM4)
-   /* Tongchou support detected by autoconf */
 #  define PIXELSERV_SM_CIPHERS \
   "ECDHE-SM2-SM4-GCM-SM3:" \
   "ECDHE-SM2-SM4-CBC-SM3:" \
   "ECC-SM2-SM4-GCM-SM3:" \
-  "ECC-SM2-SM4-CBC-SM3"
+  "ECC-SM2-SM4-CBC-SM3:" \
+  "SM4-GCM-SM3:" \
+  "SM4-CCM-SM3:" \
+  "SM4-CBC-SM3"
 #  define PIXELSERV_TLSV1_3_SM_CIPHERS \
   "TLS_SM4_GCM_SM3:" \
   "TLS_SM4_CCM_SM3"
 #  define PIXELSERV_HAS_TONGCHOU 1
 #elif defined(OPENSSL_NO_SM4)
-   /* OpenSSL compiled without SM4 support */
 #  define PIXELSERV_SM_CIPHERS ""
 #  define PIXELSERV_TLSV1_3_SM_CIPHERS ""
 #  define PIXELSERV_HAS_TONGCHOU 0
@@ -119,17 +230,25 @@
   "ECDHE-SM2-SM4-GCM-SM3:" \
   "ECDHE-SM2-SM4-CBC-SM3:" \
   "ECC-SM2-SM4-GCM-SM3:" \
-  "ECC-SM2-SM4-CBC-SM3"
+  "ECC-SM2-SM4-CBC-SM3:" \
+  "SM4-GCM-SM3:" \
+  "SM4-CCM-SM3:" \
+  "SM4-CBC-SM3"
 #  define PIXELSERV_TLSV1_3_SM_CIPHERS \
   "TLS_SM4_GCM_SM3:" \
   "TLS_SM4_CCM_SM3"
 #  define PIXELSERV_HAS_TONGCHOU 1
 #endif
 
-/* Combined cipher list with SM support */
-#define PIXELSERV_CIPHER_LIST_FULL \
-  PIXELSERV_CIPHER_LIST ":" PIXELSERV_SM_CIPHERS
+/* =============================================================================
+   COMBINED CIPHER LISTS
+   ============================================================================= */
 
+/* FULL cipher list: ALL ciphers + SM (Tongchou) */
+#define PIXELSERV_CIPHER_LIST_FULL \
+  PIXELSERV_CIPHER_LIST_ALL ":" PIXELSERV_SM_CIPHERS
+
+/* FULL TLS 1.3 cipher list with SM4 */
 #define PIXELSERV_TLSV1_3_CIPHERS_FULL \
   PIXELSERV_TLSV1_3_CIPHERS ":" PIXELSERV_TLSV1_3_SM_CIPHERS
 
@@ -176,11 +295,12 @@
 /* Legacy groups for older OpenSSL versions */
 #define PIXELSERV_GROUPS_LEGACY "X25519:P-256:P-384"
 
-/* Select cipher list based on BSI strict mode */
+/* Select cipher list based on mode */
 #if defined(BSI_STRICT_MODE)
 #  define PIXELSERV_CIPHER_LIST_ACTIVE PIXELSERV_CIPHER_LIST_STRICT
 #else
-#  define PIXELSERV_CIPHER_LIST_ACTIVE PIXELSERV_CIPHER_LIST
+   /* Default: Use ALL ciphers for maximum compatibility */
+#  define PIXELSERV_CIPHER_LIST_ACTIVE PIXELSERV_CIPHER_LIST_ALL
 #endif
 
 #if defined(SSL_CTX_set_ecdh_auto)
