@@ -60,6 +60,23 @@
        __result; }))
 #endif
 
+/* Atomic operations for stats counters - lock-free increment/decrement
+ * Uses GCC/Clang built-in atomics for thread safety without blocking */
+#if defined(__GNUC__) || defined(__clang__)
+#  define STAT_INC(x) __atomic_fetch_add(&(x), 1, __ATOMIC_RELAXED)
+#  define STAT_DEC(x) __atomic_fetch_sub(&(x), 1, __ATOMIC_RELAXED)
+#  define STAT_ADD(x, v) __atomic_fetch_add(&(x), (v), __ATOMIC_RELAXED)
+#  define STAT_LOAD(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
+#  define STAT_STORE(x, v) __atomic_store_n(&(x), (v), __ATOMIC_RELAXED)
+#else
+/* Fallback for non-GCC/Clang - not truly atomic but maintains volatile semantics */
+#  define STAT_INC(x) (++(x))
+#  define STAT_DEC(x) (--(x))
+#  define STAT_ADD(x, v) ((x) += (v))
+#  define STAT_LOAD(x) (x)
+#  define STAT_STORE(x, v) ((x) = (v))
+#endif
+
 # define FEAT_TFO
 # ifdef linux
 #   if LINUX_VERSION_CODE >= KERNEL_VERSION(3,7,0) || ENABLE_TCP_FASTOPEN

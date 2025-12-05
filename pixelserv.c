@@ -604,39 +604,39 @@ int main (int argc, char* argv[])
         log_msg(LGG_WARNING, "pipe read() got %d bytes, but %u bytes were expected - discarding",
           rv, (unsigned int)sizeof(pipedata));
       } else {
-        // process response type
+        // process response type (atomic increments for thread safety)
         switch (pipedata.status) {
-          case FAIL_GENERAL:   ++ers; break;
-          case FAIL_TIMEOUT:   ++tmo; break;
-          case FAIL_CLOSED:    ++cls; break;
-          case FAIL_REPLY:     ++cly; break;
-          case SEND_GIF:       ++gif; break;
-          case SEND_TXT:       ++txt; break;
-          case SEND_JPG:       ++jpg; break;
-          case SEND_PNG:       ++png; break;
-          case SEND_SWF:       ++swf; break;
-          case SEND_ICO:       ++ico; break;
-          case SEND_BAD:       ++bad; break;
-          case SEND_STATS:     ++sta; break;
-          case SEND_STATSTEXT: ++stt; break;
-          case SEND_204:       ++noc; break;
-          case SEND_REDIRECT:  ++rdr; break;
-          case SEND_NO_EXT:    ++nfe; break;
-          case SEND_UNK_EXT:   ++ufe; break;
-          case SEND_NO_URL:    ++nou; break;
-          case SEND_BAD_PATH:  ++pth; break;
-          case SEND_POST:      ++pst; break;
-          case SEND_HEAD:      ++hed; break;
-          case SEND_OPTIONS:   ++opt; break;
+          case FAIL_GENERAL:   STAT_INC(ers); break;
+          case FAIL_TIMEOUT:   STAT_INC(tmo); break;
+          case FAIL_CLOSED:    STAT_INC(cls); break;
+          case FAIL_REPLY:     STAT_INC(cly); break;
+          case SEND_GIF:       STAT_INC(gif); break;
+          case SEND_TXT:       STAT_INC(txt); break;
+          case SEND_JPG:       STAT_INC(jpg); break;
+          case SEND_PNG:       STAT_INC(png); break;
+          case SEND_SWF:       STAT_INC(swf); break;
+          case SEND_ICO:       STAT_INC(ico); break;
+          case SEND_BAD:       STAT_INC(bad); break;
+          case SEND_STATS:     STAT_INC(sta); break;
+          case SEND_STATSTEXT: STAT_INC(stt); break;
+          case SEND_204:       STAT_INC(noc); break;
+          case SEND_REDIRECT:  STAT_INC(rdr); break;
+          case SEND_NO_EXT:    STAT_INC(nfe); break;
+          case SEND_UNK_EXT:   STAT_INC(ufe); break;
+          case SEND_NO_URL:    STAT_INC(nou); break;
+          case SEND_BAD_PATH:  STAT_INC(pth); break;
+          case SEND_POST:      STAT_INC(pst); break;
+          case SEND_HEAD:      STAT_INC(hed); break;
+          case SEND_OPTIONS:   STAT_INC(opt); break;
           case ACTION_LOG_VERB:  log_set_verb(pipedata.verb); break;
-          case ACTION_DEC_KCC: --kcc; break;
+          case ACTION_DEC_KCC: STAT_DEC(kcc); break;
           default:
             log_msg(LOG_DEBUG, "conn_handler reported unknown response value: %d", pipedata.status);
         }
         switch (pipedata.ssl) {
-          case SSL_HIT_RTT0:   ++zrt; /* fall through */
-          case SSL_HIT:        ++slh; break;
-          case SSL_HIT_CLS:    ++slc; break;
+          case SSL_HIT_RTT0:   STAT_INC(zrt); /* fall through */
+          case SSL_HIT:        STAT_INC(slh); break;
+          case SSL_HIT_CLS:    STAT_INC(slc); break;
           default:             ;
         }
         if (pipedata.ssl == SSL_HIT ||
@@ -644,15 +644,15 @@ int main (int argc, char* argv[])
             pipedata.ssl == SSL_HIT_CLS) {
           switch (pipedata.ssl_ver) {
 #ifdef TLS1_3_VERSION
-            case TLS1_3_VERSION: ++v13; break;
+            case TLS1_3_VERSION: STAT_INC(v13); break;
 #endif
-            case TLS1_2_VERSION: ++v12; break;
-            case TLS1_VERSION:   ++v10; break;
+            case TLS1_2_VERSION: STAT_INC(v12); break;
+            case TLS1_VERSION:   STAT_INC(v10); break;
             default:             ;
           }
         }
         if (pipedata.status < ACTION_LOG_VERB) {
-          count++;
+          STAT_INC(count);
           // count only positive receive sizes
           if (pipedata.rx_total <= 0) {
             log_msg(LOG_DEBUG, "pipe read() got nonsensical rx_total data value %d - ignoring", pipedata.rx_total);
@@ -680,8 +680,8 @@ int main (int argc, char* argv[])
         } else if (pipedata.status == ACTION_DEC_KCC) {
           static int kvg_cnt = 0;
           kvg = ema(kvg, pipedata.krq, &kvg_cnt);
-          if (pipedata.krq > krq)
-            krq = pipedata.krq;
+          if (pipedata.krq > STAT_LOAD(krq))
+            STAT_STORE(krq, pipedata.krq);
         }
       }
       --select_rv;
@@ -707,13 +707,13 @@ int main (int argc, char* argv[])
     new_fd = accept(sockfd, (struct sockaddr *) &their_addr, &sin_size);
     if (new_fd < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            cls++;   /* client closed connection before we got a chance to accept it */
+            STAT_INC(cls);   /* client closed connection before we got a chance to accept it */
         }
         log_msg(LGG_DEBUG, "accept: %m");
         continue;
     }
-    if (kcc >= max_num_threads) {
-        clt++;
+    if (STAT_LOAD(kcc) >= max_num_threads) {
+        STAT_INC(clt);
         shutdown(new_fd, SHUT_RDWR);
         close(new_fd);
         continue;
@@ -817,17 +817,17 @@ skip_ssl_accept:
         case SSL_ERROR_SSL:
           switch(ERR_GET_REASON(ERR_peek_last_error())) {
               case SSL_R_SSLV3_ALERT_BAD_CERTIFICATE:
-                  ucb++;
+                  STAT_INC(ucb);
                   log_msg(LGG_WARNING, "handshake failed: bad cert. client %s:%s server %s",
                       ip_buf, port_buf, t->servername);
                   break;
               case SSL_R_TLSV1_ALERT_UNKNOWN_CA:
-                  uca++;
+                  STAT_INC(uca);
                   log_msg(LGG_WARNING, "handshake failed: unknown CA. client %s:%s server %s",
                       ip_buf, port_buf, t->servername);
                   break;
               case SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN:
-                  uce++;
+                  STAT_INC(uce);
                   log_msg(LGG_WARNING, "handshake failed: unknown cert. client %s:%s server %s",
                       ip_buf, port_buf, t->servername);
                   break;
@@ -852,7 +852,7 @@ skip_ssl_accept:
               char m[2];
               int rv = recv(new_fd, m, 2, MSG_PEEK);
               if (rv == 0) {
-                ush++;
+                STAT_INC(ush);
                 log_msg(LGG_WARNING, "handshake failed: shutdown after ServerHello. client %s:%s server %s",
                   ip_buf, port_buf, t->servername);
                 break;
@@ -863,12 +863,12 @@ skip_ssl_accept:
         default:
           ;
       }
-      count++;
+      STAT_INC(count);
       switch(t->status) {
-        case SSL_ERR:        ++sle; break;
-        case SSL_MISS:       ++slm; break;
+        case SSL_ERR:        STAT_INC(sle); break;
+        case SSL_MISS:       STAT_INC(slm); break;
         case SSL_HIT:
-        case SSL_UNKNOWN:    ++slu; break;
+        case SSL_UNKNOWN:    STAT_INC(slu); break;
         default:             ;
       }
       SSL_set_shutdown(ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
@@ -901,8 +901,11 @@ start_service_thread:
     }
     pthread_attr_destroy(&attr);
 
-    if (++kcc > kmx)
-      kmx = kcc;
+    {
+      sig_atomic_t new_kcc = STAT_INC(kcc) + 1;  /* STAT_INC returns old value */
+      if (new_kcc > STAT_LOAD(kmx))
+        STAT_STORE(kmx, new_kcc);
+    }
   } // end of perpetual accept() loop
 
   pthread_cancel(certgen_thread);

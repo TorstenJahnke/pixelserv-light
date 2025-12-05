@@ -38,6 +38,7 @@ static unsigned int  sslctx_tbl_last_flush;
 static void **conn_stor;
 static int conn_stor_last = -1, conn_stor_max = -1;
 static pthread_mutex_t cslock;
+static pthread_rwlock_t sslctx_tbl_rwlock;
 
 #define SSLCTX_TBL_ptr(h)         ((sslctx_cache_struct *)(sslctx_tbl + h))
 #define SSLCTX_TBL_get(h, k)      SSLCTX_TBL_ptr(h)->k
@@ -125,16 +126,20 @@ void sslctx_tbl_init(int tbl_size)
         sslctx_tbl_size = tbl_size;
         sslctx_tbl_cnt_hit = sslctx_tbl_cnt_miss = sslctx_tbl_cnt_purge = sslctx_tbl_last_flush = 0;
         memset(sslctx_tbl, 0, tbl_size * sizeof(sslctx_cache_struct));
+        pthread_rwlock_init(&sslctx_tbl_rwlock, NULL);
     }
 }
 
 void sslctx_tbl_cleanup()
 {
     int idx;
+    pthread_rwlock_wrlock(&sslctx_tbl_rwlock);
     for (idx = 0; idx < sslctx_tbl_end; idx++) {
         free(SSLCTX_TBL_get(idx, cert_name));
         SSL_CTX_free(SSLCTX_TBL_get(idx, sslctx));
     }
+    pthread_rwlock_unlock(&sslctx_tbl_rwlock);
+    pthread_rwlock_destroy(&sslctx_tbl_rwlock);
 }
 
 static int cmp_sslctx_reuse_count(const void *p1, const void *p2)
@@ -148,6 +153,7 @@ static int cmp_sslctx_certname(const void *k, const void *p)
     return strcmp(((sslctx_cache_struct *)k)->cert_name, ((sslctx_cache_struct *)p)->cert_name);
 }
 
+/* NOTE: Called during single-threaded startup only - no locking needed */
 void sslctx_tbl_load(const char* pem_dir, const STACK_OF(X509_INFO) *cachain)
 {
     FILE *fp;
@@ -184,6 +190,8 @@ quit_load:
     free(line);
 }
 
+/* NOTE: Called from signal handler during shutdown - async-signal-unsafe
+ * but acceptable since followed by exit() */
 void sslctx_tbl_save(const char* pem_dir)
 {
     #define RATIO_TO_SAVE 1
@@ -258,6 +266,8 @@ static int sslctx_tbl_lookup(char* cert_name, int* found_idx, int* ins_idx)
         return -1;
     }
 
+    pthread_rwlock_wrlock(&sslctx_tbl_rwlock);
+
     sslctx_cache_struct key, *found;
     key.cert_name = cert_name;
     found = bsearch(&key, SSLCTX_TBL_ptr(0), sslctx_tbl_end, sizeof(sslctx_cache_struct), cmp_sslctx_certname);
@@ -281,6 +291,8 @@ static int sslctx_tbl_lookup(char* cert_name, int* found_idx, int* ins_idx)
         }
         *ins_idx = purge_idx;
     }
+
+    pthread_rwlock_unlock(&sslctx_tbl_rwlock);
     return 0;
 }
 
@@ -319,17 +331,45 @@ static int sslctx_tbl_insert(const char *cert_name, SSL_CTX *sslctx, int ins_idx
 }
 
 static int sslctx_tbl_cache(const char *cert_name, SSL_CTX *sslctx, int ins_idx)
-{   int ret = -1;
+{
+    int ret = -1;
+
+    pthread_rwlock_wrlock(&sslctx_tbl_rwlock);
+
+    /* Double-check: another thread might have cached this cert while we loaded it */
+    sslctx_cache_struct key, *found;
+    key.cert_name = (char *)cert_name;
+    found = bsearch(&key, SSLCTX_TBL_ptr(0), sslctx_tbl_end, sizeof(sslctx_cache_struct), cmp_sslctx_certname);
+
+    if (found != NULL) {
+        /* Already cached by another thread - update stats and discard our copy */
+        found->reuse_count++;
+        found->last_use = process_uptime();
+        pthread_rwlock_unlock(&sslctx_tbl_rwlock);
+        SSL_CTX_free(sslctx);  /* Free duplicate */
+        return 0;
+    }
+
     if (sslctx_tbl_insert(cert_name, sslctx, ins_idx) == 0) {
         qsort(SSLCTX_TBL_ptr(0), sslctx_tbl_end, sizeof(sslctx_cache_struct), cmp_sslctx_certname);
         ret = 0;
     }
+
+    pthread_rwlock_unlock(&sslctx_tbl_rwlock);
     return ret;
 }
 
 static int sslctx_tbl_purge(int idx) {
     if (idx < 0 || idx >= sslctx_tbl_end || sslctx_tbl_end <= 0)
         return -1;
+
+    pthread_rwlock_wrlock(&sslctx_tbl_rwlock);
+
+    /* Re-validate idx after acquiring lock */
+    if (idx >= sslctx_tbl_end) {
+        pthread_rwlock_unlock(&sslctx_tbl_rwlock);
+        return -1;
+    }
 
     if (SSLCTX_TBL_get(idx, cert_name))
         free(SSLCTX_TBL_get(idx, cert_name));
@@ -343,6 +383,7 @@ static int sslctx_tbl_purge(int idx) {
         memset(SSLCTX_TBL_ptr(sslctx_tbl_end), 0, sizeof(sslctx_cache_struct));
     }
 
+    pthread_rwlock_unlock(&sslctx_tbl_rwlock);
     return 0;
 }
 
