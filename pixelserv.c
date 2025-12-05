@@ -224,7 +224,7 @@ int main (int argc, char* argv[])
           case 'K':
             errno = 0;
             cert_key_type = strtol(argv[i], NULL, 10);
-            if (errno || cert_key_type < 0 || cert_key_type > 5) {
+            if (errno || cert_key_type < 0 || cert_key_type > 7) {
               error = 1;
             }
           continue;
@@ -338,7 +338,11 @@ int main (int argc, char* argv[])
            "\t" "-k  HTTPS_PORT\t\t(default: "
            SECOND_PORT
            ")" "\n"
-           "\t" "-K  KEY_TYPE\t\t(0:RSA2048 1:RSA4096 2:ECDSA-P256 3:ECDSA-P384 4:RSA8192 5:RSA16384, default: 2)" "\n"
+           "\t" "-K  KEY_TYPE\t\t(0:RSA2048 1:RSA3072 2:RSA4096 3:RSA8192 4:RSA16384 5:ECDSA-P256 6:ECDSA-P384"
+#ifdef HAVE_SM2
+           " 7:SM2"
+#endif
+           ", default: 1)" "\n"
            "\t" "-l  LEVEL\t\t(0:critical 1:error<default> 2:warning 3:notice 4:info 5:debug)" "\n"
 #ifdef IF_MODE
            "\t" "-n  IFACE\t\t(default: all interfaces)" "\n"
