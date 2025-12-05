@@ -2,8 +2,7 @@
 #define UTIL_H
 
 // common configuration items
-
-#define _GNU_SOURCE             // using a bunch of gcc-specific stuff
+// _GNU_SOURCE is set by Makefile on Linux only
 
 // system includes used by more than one source file
 #include <errno.h>              // EPIPE, errno, EINTR
@@ -70,15 +69,8 @@
 # define DEFAULT_STATS_URL "/servstats"
 # define DEFAULT_STATS_TEXT_URL "/servstats.txt"
 
-/* taken from glibc unistd.h and fixes musl */
-#ifndef TEMP_FAILURE_RETRY
-#define TEMP_FAILURE_RETRY(expression) \
-  (__extension__                                                              \
-    ({ long int __result;                                                     \
-       do __result = (long int) (expression);                                 \
-       while (__result == -1L && errno == EINTR);                             \
-       __result; }))
-#endif
+// TEMP_FAILURE_RETRY is in compat.h
+#include "compat.h"
 
 /* Atomic operations for stats counters - lock-free increment/decrement
  * Uses GCC/Clang built-in atomics for thread safety without blocking */

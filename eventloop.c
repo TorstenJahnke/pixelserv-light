@@ -1,4 +1,4 @@
-#define _GNU_SOURCE
+/* _GNU_SOURCE is defined by Makefile on Linux */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
