@@ -120,7 +120,7 @@ extern volatile sig_atomic_t ush;
 extern volatile sig_atomic_t kcc;
 extern volatile sig_atomic_t kmx;
 extern volatile sig_atomic_t kct;
-extern float kvg;
+extern volatile float kvg;
 extern volatile sig_atomic_t krq;
 extern volatile sig_atomic_t clt;
 extern volatile sig_atomic_t v13;

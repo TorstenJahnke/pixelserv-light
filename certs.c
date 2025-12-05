@@ -95,7 +95,7 @@ conn_tlstor_struct* conn_stor_acquire() {
     conn_tlstor_struct *ret = NULL;
 
     pthread_mutex_lock(&cslock);
-    if (conn_stor_last > 0) {
+    if (conn_stor_last >= 0) {
         ret = conn_stor[conn_stor_last];
         conn_stor[conn_stor_last--] = NULL;
     }
@@ -330,9 +330,9 @@ static int sslctx_tbl_purge(int idx) {
     if (idx < 0 || idx >= sslctx_tbl_end || sslctx_tbl_end <= 0)
         return -1;
 
-    if (!SSLCTX_TBL_get(idx, cert_name))
+    if (SSLCTX_TBL_get(idx, cert_name))
         free(SSLCTX_TBL_get(idx, cert_name));
-    if (!SSLCTX_TBL_get(idx, sslctx))
+    if (SSLCTX_TBL_get(idx, sslctx))
         SSL_CTX_free(SSLCTX_TBL_get(idx, sslctx));
     --sslctx_tbl_end;
     if (idx < sslctx_tbl_end) {
@@ -511,7 +511,7 @@ quit_cb:
 
 void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
 {
-    FILE *fp;
+    FILE *fp = NULL;
     char cert_file[PIXELSERV_MAX_PATH];
     X509 *x509 = X509_new();
 
@@ -519,10 +519,11 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/ca.crt", pem_dir);
     fp = fopen(cert_file, "r");
 
-    if(!fp || !PEM_read_X509(fp, &x509, NULL, NULL))
+    if(!fp || !PEM_read_X509(fp, &x509, NULL, NULL)) {
        log_msg(LGG_ERR, "%s: failed to load ca.crt", __FUNCTION__);
-    else {
-        char *cafile;
+       if (fp) fclose(fp);
+    } else {
+        char *cafile = NULL;
         int fsz;
         BIO *bioin;
         EVP_PKEY *pubkey = X509_get_pubkey(x509);
@@ -532,6 +533,13 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
 
         fsz = ftell(fp);
         cafile = malloc(fsz);
+        if (!cafile) {
+            log_msg(LGG_ERR, "%s: failed to allocate memory for ca.crt", __FUNCTION__);
+            EVP_PKEY_free(pubkey);
+            fclose(fp);
+            X509_free(x509);
+            return;
+        }
         fseek(fp, 0L, SEEK_SET);
         fsz = fread(cafile, 1, fsz, fp);
 
@@ -557,7 +565,7 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     fp = fopen(cert_file, "r");
     if(!fp || !PEM_read_PrivateKey(fp, &ct->privkey, pem_passwd_cb, (void*)pem_dir))
         log_msg(LGG_ERR, "%s: failed to load ca.key", __FUNCTION__);
-    fclose(fp);
+    if (fp) fclose(fp);
 }
 
 void cert_tlstor_cleanup(cert_tlstor_t *c)
@@ -845,8 +853,11 @@ static SSL_CTX* create_child_sslctx(const char* full_pem_path, const STACK_OF(X5
     SSL_CTX_set_tmp_ecdh(sslctx, ecdh);
     EC_KEY_free(ecdh);
 #else
-    int glist [] = { NID_X9_62_prime256v1 };
-    SSL_CTX_set1_groups(sslctx, glist, sizeof(glist)/sizeof(glist[0]));
+    /* Try to set groups with SM2 support, fall back to legacy if not available */
+    if (SSL_CTX_set1_groups_list(sslctx, PIXELSERV_GROUPS) <= 0) {
+        log_msg(LGG_DEBUG, "%s: SM2 groups not available, using legacy groups", __FUNCTION__);
+        SSL_CTX_set1_groups_list(sslctx, PIXELSERV_GROUPS_LEGACY);
+    }
 #endif
 
     SSL_CTX_set_options(sslctx,
@@ -859,14 +870,21 @@ static SSL_CTX* create_child_sslctx(const char* full_pem_path, const STACK_OF(X5
     SSL_CTX_set_session_cache_mode(sslctx, SSL_SESS_CACHE_NO_AUTO_CLEAR | SSL_SESS_CACHE_SERVER);
     SSL_CTX_set_timeout(sslctx, PIXEL_SSL_SESS_TIMEOUT);
     SSL_CTX_sess_set_cache_size(sslctx, 1);
-    if (SSL_CTX_set_cipher_list(sslctx, PIXELSERV_CIPHER_LIST) <= 0)
-        log_msg(LGG_DEBUG, "%s: failed to set cipher list", __FUNCTION__);
+    /* Try full cipher list with SM support, fall back to standard if not available */
+    if (SSL_CTX_set_cipher_list(sslctx, PIXELSERV_CIPHER_LIST_FULL) <= 0) {
+        log_msg(LGG_DEBUG, "%s: SM ciphers not available, using standard cipher list", __FUNCTION__);
+        if (SSL_CTX_set_cipher_list(sslctx, PIXELSERV_CIPHER_LIST) <= 0)
+            log_msg(LGG_DEBUG, "%s: failed to set cipher list", __FUNCTION__);
+    }
 #ifdef TLS1_3_VERSION
-    SSL_CTX_set1_groups_list(sslctx, "X25519:P-256");
     SSL_CTX_set_min_proto_version(sslctx, TLS1_VERSION);
     SSL_CTX_set_max_proto_version(sslctx, TLS1_3_VERSION);
-    if (SSL_CTX_set_ciphersuites(sslctx, PIXELSERV_TLSV1_3_CIPHERS) <= 0)
-        log_msg(LGG_DEBUG, "%s: failed to set TLSv1.3 ciphersuites", __FUNCTION__);
+    /* Try TLS 1.3 ciphers with SM4 support, fall back if not available */
+    if (SSL_CTX_set_ciphersuites(sslctx, PIXELSERV_TLSV1_3_CIPHERS_FULL) <= 0) {
+        log_msg(LGG_DEBUG, "%s: SM4 TLS 1.3 ciphers not available, using standard suites", __FUNCTION__);
+        if (SSL_CTX_set_ciphersuites(sslctx, PIXELSERV_TLSV1_3_CIPHERS) <= 0)
+            log_msg(LGG_DEBUG, "%s: failed to set TLSv1.3 ciphersuites", __FUNCTION__);
+    }
 #endif
     if(SSL_CTX_use_certificate_file(sslctx, full_pem_path, SSL_FILETYPE_PEM) <= 0
        || SSL_CTX_use_PrivateKey_file(sslctx, full_pem_path, SSL_FILETYPE_PEM) <= 0)
@@ -907,12 +925,21 @@ SSL_CTX* create_default_sslctx(const char *pem_dir)
 /*    // cb for server-side caching
     SSL_CTX_sess_set_new_cb(g_sslctx, new_session);
     SSL_CTX_sess_set_remove_cb(g_sslctx, remove_session); */
-    if (SSL_CTX_set_cipher_list(g_sslctx, PIXELSERV_CIPHER_LIST) <= 0)
-        log_msg(LGG_DEBUG, "cipher_list cannot be set");
+    /* Try full cipher list with SM support, fall back to standard if not available */
+    if (SSL_CTX_set_cipher_list(g_sslctx, PIXELSERV_CIPHER_LIST_FULL) <= 0) {
+        log_msg(LGG_DEBUG, "SM ciphers not available, using standard cipher list");
+        if (SSL_CTX_set_cipher_list(g_sslctx, PIXELSERV_CIPHER_LIST) <= 0)
+            log_msg(LGG_DEBUG, "cipher_list cannot be set");
+    }
 #ifndef TLS1_3_VERSION
     SSL_CTX_set_tlsext_servername_callback(g_sslctx, tls_servername_cb);
 #else
     SSL_CTX_set_max_early_data(g_sslctx, PIXEL_TLS_EARLYDATA_SIZE);
+    /* Set TLS 1.3 ciphers with SM4 support */
+    if (SSL_CTX_set_ciphersuites(g_sslctx, PIXELSERV_TLSV1_3_CIPHERS_FULL) <= 0) {
+        log_msg(LGG_DEBUG, "SM4 TLS 1.3 ciphers not available, using standard suites");
+        SSL_CTX_set_ciphersuites(g_sslctx, PIXELSERV_TLSV1_3_CIPHERS);
+    }
 #endif
     return g_sslctx;
 }

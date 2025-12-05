@@ -15,17 +15,64 @@
 #define PIXELSERV_MAX_PATH 1024
 #define PIXELSERV_MAX_SERVER_NAME 255
 
-/* ECDHE-RSA-AES128-GCM-SHA256 :
-   Android >= 4.4.2; Chrome >= 51; Firefox >= 49;
-   IE 11 Win 10; Edge >= 13; Safari >= 9; Apple ATS 9 iOS 9
-   ECDHE-RSA-AES128-SHA :
-   IE 11 Win 7,8.1; IE 11 Winphone 8.1; Opera >= 17; Safar 7 iOS 7.1 */
+/* Modern TLS 1.2 Cipher List (2024+)
+   Priority: CHACHA20 for mobile/ARM, then AES-GCM, with ECDHE key exchange
+   Compatibility: Android >= 4.4.2; Chrome >= 51; Firefox >= 49;
+   IE 11 Win 10; Edge >= 13; Safari >= 9; iOS >= 9
+   Legacy fallback for older clients included at end */
 #define PIXELSERV_CIPHER_LIST \
-  "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:" \
-  "ECDHE-RSA-AES128-SHA:DHE-RSA-AES128-SHA:AES128-SHA"
+  "ECDHE-ECDSA-CHACHA20-POLY1305:" \
+  "ECDHE-RSA-CHACHA20-POLY1305:" \
+  "ECDHE-ECDSA-AES256-GCM-SHA384:" \
+  "ECDHE-RSA-AES256-GCM-SHA384:" \
+  "ECDHE-ECDSA-AES128-GCM-SHA256:" \
+  "ECDHE-RSA-AES128-GCM-SHA256:" \
+  "DHE-RSA-AES256-GCM-SHA384:" \
+  "DHE-RSA-AES128-GCM-SHA256:" \
+  "ECDHE-RSA-AES128-SHA:" \
+  "DHE-RSA-AES128-SHA:" \
+  "AES128-GCM-SHA256:" \
+  "AES256-GCM-SHA384:" \
+  "AES128-SHA"
 
+/* TLS 1.3 Cipher Suites (RFC 8446)
+   All mandatory and recommended suites including SM4 for Tongchou/GM compliance */
 #define PIXELSERV_TLSV1_3_CIPHERS \
-  "TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256"
+  "TLS_AES_256_GCM_SHA384:" \
+  "TLS_CHACHA20_POLY1305_SHA256:" \
+  "TLS_AES_128_GCM_SHA256:" \
+  "TLS_AES_128_CCM_SHA256:" \
+  "TLS_AES_128_CCM_8_SHA256"
+
+/* SM2/SM3/SM4 Cipher Suites for Tongchou (Chinese GM/T Standards)
+   Requires OpenSSL 1.1.1+ compiled with enable-sm2 enable-sm3 enable-sm4
+   SM2: Elliptic Curve (similar to ECDSA/ECDH)
+   SM3: Hash function (256-bit, similar to SHA-256)
+   SM4: Block cipher (128-bit, similar to AES-128) */
+#ifdef OPENSSL_NO_SM4
+#  define PIXELSERV_SM_CIPHERS ""
+#  define PIXELSERV_TLSV1_3_SM_CIPHERS ""
+#else
+#  define PIXELSERV_SM_CIPHERS \
+  "ECDHE-SM2-SM4-GCM-SM3:" \
+  "ECDHE-SM2-SM4-CBC-SM3:" \
+  "ECC-SM2-SM4-GCM-SM3:" \
+  "ECC-SM2-SM4-CBC-SM3"
+#  define PIXELSERV_TLSV1_3_SM_CIPHERS \
+  "TLS_SM4_GCM_SM3:" \
+  "TLS_SM4_CCM_SM3"
+#endif
+
+/* Combined cipher list with SM support */
+#define PIXELSERV_CIPHER_LIST_FULL \
+  PIXELSERV_CIPHER_LIST ":" PIXELSERV_SM_CIPHERS
+
+#define PIXELSERV_TLSV1_3_CIPHERS_FULL \
+  PIXELSERV_TLSV1_3_CIPHERS ":" PIXELSERV_TLSV1_3_SM_CIPHERS
+
+/* ECDH Groups for key exchange, including SM2 curve for Tongchou */
+#define PIXELSERV_GROUPS "X25519:P-256:P-384:SM2"
+#define PIXELSERV_GROUPS_LEGACY "X25519:P-256"
 
 #if defined(SSL_CTX_set_ecdh_auto)
 # define PIXELSRV_SSL_HAS_ECDH_AUTO
