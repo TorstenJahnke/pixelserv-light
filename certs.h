@@ -349,7 +349,7 @@ typedef struct {
     unsigned int last_use; /* seconds since process up */
     int reuse_count;
     SSL_CTX *sslctx;
-    pthread_mutex_t lock;
+    /* Note: No per-entry lock - table uses lock-free seqlock pattern */
 } sslctx_cache_struct;
 
 #define CONN_TLSTOR(p, e) ((conn_tlstor_struct*)p)->e
@@ -364,8 +364,6 @@ void sslctx_tbl_cleanup();
 void sslctx_tbl_load(const char* pem_dir, const STACK_OF(X509_INFO) *cachain);
 void sslctx_tbl_save(const char* pem_dir);
 void run_benchmark(const cert_tlstor_t *ct, const char *cert);
-void sslctx_tbl_lock(int idx);
-void sslctx_tbl_unlock(int idx);
 int sslctx_tbl_get_cnt_total();
 int sslctx_tbl_get_cnt_hit();
 int sslctx_tbl_get_cnt_miss();
