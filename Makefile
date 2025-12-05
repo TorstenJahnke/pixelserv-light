@@ -133,7 +133,7 @@ SRCS := pixelserv.c socket_handler.c certs.c logger.c util.c eventloop.c
 OBJS := $(SRCS:.c=.o)
 
 # TLSGate (ultra-scale architecture)
-TLSGATE_SRCS := src/tlsgate.c src/connection.c src/buffer_pool.c src/worker.c
+TLSGATE_SRCS := src/tlsgate.c src/connection.c src/buffer_pool.c src/worker.c src/response.c
 TLSGATE_OBJS := $(TLSGATE_SRCS:.c=.o)
 TLSGATE_BIN := tlsgate
 

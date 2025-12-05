@@ -21,6 +21,7 @@
 #include <sched.h>
 
 #include "../include/worker.h"
+#include "../include/response.h"
 
 /* =============================================================================
  * Time Utilities
@@ -280,13 +281,124 @@ void worker_accept_connection(worker_t *worker, int listen_fd)
 }
 
 /* =============================================================================
+ * HTTP Request Parsing and Response Generation
+ * =============================================================================
+ */
+
+/*
+ * Parse HTTP request line and extract method/path
+ * Input: "GET /path/file.js HTTP/1.1\r\n..."
+ * Returns: 0 on success, -1 on error
+ */
+static int parse_http_request(const char *buf, char *method, size_t method_size,
+                              char *path, size_t path_size)
+{
+    if (!buf || !method || !path)
+        return -1;
+
+    /* Find method (first space-delimited token) */
+    const char *p = buf;
+    size_t i = 0;
+    while (*p && *p != ' ' && *p != '\r' && i < method_size - 1) {
+        method[i++] = *p++;
+    }
+    method[i] = '\0';
+
+    if (*p != ' ')
+        return -1;
+    p++;  /* Skip space */
+
+    /* Find path (second space-delimited token) */
+    i = 0;
+    while (*p && *p != ' ' && *p != '\r' && *p != '?' && i < path_size - 1) {
+        path[i++] = *p++;
+    }
+    path[i] = '\0';
+
+    return 0;
+}
+
+/*
+ * Check if request has Connection: keep-alive
+ */
+static int check_keepalive(const char *buf)
+{
+    /* HTTP/1.1 defaults to keep-alive */
+    if (strstr(buf, "HTTP/1.1"))
+        return 1;
+
+    /* Explicit Connection: keep-alive header */
+    const char *conn_hdr = strcasestr(buf, "Connection:");
+    if (conn_hdr) {
+        if (strcasestr(conn_hdr, "keep-alive"))
+            return 1;
+        if (strcasestr(conn_hdr, "close"))
+            return 0;
+    }
+
+    return 0;  /* HTTP/1.0 default is close */
+}
+
+/*
+ * Generate response for a connection that just finished reading
+ */
+static int worker_generate_response(connection_t *conn)
+{
+    char method[16] = {0};
+    char path[512] = {0};
+
+    /* Parse HTTP request */
+    if (parse_http_request(conn->hot.read_buf, method, sizeof(method),
+                           path, sizeof(path)) != 0) {
+        /* Bad request - send 404 */
+        response_t resp = RESP_404_NOT_FOUND;
+        memcpy(conn->hot.write_buf, resp.data, resp.len);
+        conn->hot.write_len = resp.len;
+        conn->hot.write_pos = 0;
+        return 0;
+    }
+
+    /* Check keep-alive */
+    if (check_keepalive(conn->hot.read_buf)) {
+        conn->hot.flags |= CONN_FLAG_KEEPALIVE;
+    }
+
+    /* Generate response based on path and method */
+    response_t resp;
+    if (response_generate(path, method, &resp) != 0) {
+        resp = RESP_404_NOT_FOUND;
+    }
+
+    /* Copy response to write buffer (limited by buffer size) */
+    size_t copy_len = resp.len;
+    if (copy_len > 4096)
+        copy_len = 4096;  /* Buffer size limit */
+
+    memcpy(conn->hot.write_buf, resp.data, copy_len);
+    conn->hot.write_len = copy_len;
+    conn->hot.write_pos = 0;
+
+    /* Free dynamic response */
+    response_free(&resp);
+
+    return 0;
+}
+
+/* =============================================================================
  * Handle Connection Events
  * =============================================================================
  */
 
 void worker_handle_connection(worker_t *worker, connection_t *conn, uint32_t events)
 {
+    conn_state_t old_state = conn->hot.state;
     int ret = conn_advance(conn, events);
+
+    /* Check if we just transitioned to WRITE_RESPONSE - need to generate response */
+    if (old_state == CONN_STATE_READ_REQUEST &&
+        conn->hot.state == CONN_STATE_WRITE_RESPONSE) {
+        worker_generate_response(conn);
+    }
 
     if (ret < 0) {
         /* Connection should be closed */
