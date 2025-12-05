@@ -35,6 +35,7 @@
   - 256 shards (00.idx - ff.idx) based on FNV-1a hash
   - Lock-free parallel access to different shards
   - Automatic index updates on certificate generation
+* NEW IPv6 dual-stack support (AF_UNSPEC + IPV6_V6ONLY=0)
 * FIXED thread safety: fully lock-free design eliminates all race conditions
 * FIXED atomic operations for all stats counters (lock-free STAT_INC/STAT_DEC)
 * FIXED BIO NULL pointer check crash in certificate loading
