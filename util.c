@@ -47,13 +47,17 @@ volatile sig_atomic_t uce = 0;
 volatile sig_atomic_t ush = 0;
 volatile sig_atomic_t kcc = 0;
 volatile sig_atomic_t kmx = 0;
-float kvg = 0.0;
+volatile float kvg = 0.0;
 volatile sig_atomic_t krq = 0;
 volatile sig_atomic_t clt = 0;
 volatile sig_atomic_t v13 = 0;
 volatile sig_atomic_t v12 = 0;
 volatile sig_atomic_t v10 = 0;
 volatile sig_atomic_t zrt = 0;
+
+// Certificate configuration
+int cert_validity_days = DEFAULT_CERT_VALIDITY_DAYS;
+int cert_key_type = DEFAULT_CERT_KEY_TYPE;
 
 // private data
 static struct timespec startup_time = {0, 0};

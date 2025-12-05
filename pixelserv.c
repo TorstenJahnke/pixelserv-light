@@ -194,6 +194,20 @@ int main (int argc, char* argv[])
               error = 1;
             }
           continue;
+          case 'd':
+            errno = 0;
+            cert_validity_days = strtol(argv[i], NULL, 10);
+            if (errno || cert_validity_days <= 0 || cert_validity_days > 825) {
+              error = 1;
+            }
+          continue;
+          case 'K':
+            errno = 0;
+            cert_key_type = strtol(argv[i], NULL, 10);
+            if (errno || cert_key_type < 0 || cert_key_type > 3) {
+              error = 1;
+            }
+          continue;
           case 'l':
             if ((logger_level)atoi(argv[i]) > LGG_DEBUG
                 || atoi(argv[i]) < 0)
@@ -282,12 +296,14 @@ int main (int argc, char* argv[])
            "\t" "-A  ADMIN_PORT\t\t(HTTPS only. Default is none)" "\n"
            "\t" "-B  [CERT_FILE]\t\t(Benchmark crypto and disk then quit)" "\n"
            "\t" "-c  CERT_CACHE_SIZE\t(default: %d)" "\n"
+           "\t" "-d  CERT_DAYS\t\t(certificate validity days, default: %d, max: 825)" "\n"
 #ifndef TEST
            "\t" "-f\t\t\t(stay in foreground/don't daemonize)" "\n"
 #endif // !TEST
            "\t" "-k  HTTPS_PORT\t\t(default: "
            SECOND_PORT
            ")" "\n"
+           "\t" "-K  KEY_TYPE\t\t(0:RSA2048 1:RSA4096 2:ECDSA-P256 3:ECDSA-P384, default: 0)" "\n"
            "\t" "-l  LEVEL\t\t(0:critical 1:error<default> 2:warning 3:notice 4:info 5:debug)" "\n"
 #ifdef IF_MODE
            "\t" "-n  IFACE\t\t(default: all interfaces)" "\n"
@@ -314,7 +330,7 @@ int main (int argc, char* argv[])
            "\t" "-z  CERT_PATH\t\t(default: "
            DEFAULT_PEM_PATH
            ")" "\n"
-           , VERSION, DEFAULT_CERT_CACHE_SIZE, DEFAULT_KEEPALIVE,
+           , VERSION, DEFAULT_CERT_CACHE_SIZE, DEFAULT_CERT_VALIDITY_DAYS, DEFAULT_KEEPALIVE,
            DEFAULT_THREAD_MAX);
     exit(EXIT_FAILURE);
   }
@@ -820,9 +836,9 @@ skip_ssl_accept:
                     break;
                   /* fall through */
               default:
-                  log_msg(LGG_WARNING, "handshake failed: client %s:%s server %s. Lib(%d) Func(%d) Reason(%d)",
+                  log_msg(LGG_WARNING, "handshake failed: client %s:%s server %s. Lib(%d) Reason(%d)",
                       ip_buf, port_buf, t->servername,
-                          ERR_GET_LIB(ERR_peek_last_error()), ERR_GET_FUNC(ERR_peek_last_error()),
+                          ERR_GET_LIB(ERR_peek_last_error()),
                               ERR_GET_REASON(ERR_peek_last_error()));
           }
           break;
