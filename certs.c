@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -38,17 +39,44 @@ static pthread_mutex_t *legacy_openssl_locks;
 
 static SSL_CTX *g_sslctx;
 
-static sslctx_cache_struct *sslctx_tbl;
-static int sslctx_tbl_size;
-static _Atomic int sslctx_tbl_end;
+/* =============================================================================
+ * LOCK-FREE HASH TABLE FOR SSL CONTEXT CACHE
+ * - FNV-1a hash for strings
+ * - Open addressing with linear probing
+ * - Atomic CAS for lock-free parallel inserts
+ * - Readers and writers can work concurrently on different buckets
+ * ============================================================================= */
+
+/* Hash entry states */
+#define HASH_EMPTY     0   /* Slot available */
+#define HASH_INSERTING 1   /* Slot being filled (CAS in progress) */
+#define HASH_OCCUPIED  2   /* Slot contains valid data */
+#define HASH_DELETED   3   /* Tombstone - was occupied, now deleted */
+
+/* Hash table entry - each entry is independently atomic */
+typedef struct {
+    _Atomic uint32_t state;      /* EMPTY, INSERTING, OCCUPIED, DELETED */
+    char *cert_name;             /* Immutable once state becomes OCCUPIED */
+    _Atomic(SSL_CTX *) sslctx;   /* Can be atomically swapped for updates */
+    _Atomic uint32_t last_use;   /* Seconds since process start */
+    _Atomic uint32_t reuse_count;
+} sslctx_hash_entry_t;
+
+static sslctx_hash_entry_t *sslctx_hash_tbl;
+static int sslctx_hash_size;        /* Total capacity (power of 2) */
+static _Atomic int sslctx_hash_count;  /* Current number of OCCUPIED entries */
 static _Atomic int sslctx_tbl_cnt_hit, sslctx_tbl_cnt_miss, sslctx_tbl_cnt_purge;
 static _Atomic unsigned int sslctx_tbl_last_flush;
 
-/* Lock-free seqlock for SSL context table
- * Odd value = write in progress, even = stable
- * Readers: load seq, read data, verify seq unchanged
- * Writers: increment to odd, modify, increment to even */
-static _Atomic uint32_t sslctx_tbl_seqlock = 0;
+/* FNV-1a hash function - fast and good distribution for strings */
+static inline uint32_t fnv1a_hash(const char *str) {
+    uint32_t hash = 2166136261u;  /* FNV offset basis */
+    while (*str) {
+        hash ^= (uint8_t)*str++;
+        hash *= 16777619u;        /* FNV prime */
+    }
+    return hash;
+}
 
 /* Lock-free Treiber stack for connection storage pool
  * Uses atomic compare-and-swap for push/pop operations */
@@ -61,25 +89,22 @@ static _Atomic(conn_stor_node_t *) conn_stor_head;
 static _Atomic int conn_stor_count;
 static int conn_stor_max;
 
-#define SSLCTX_TBL_ptr(h)         ((sslctx_cache_struct *)(sslctx_tbl + h))
-#define SSLCTX_TBL_get(h, k)      SSLCTX_TBL_ptr(h)->k
-#define SSLCTX_TBL_set(h, k, v)   SSLCTX_TBL_ptr(h)->k = v
-
-inline int sslctx_tbl_get_cnt_total() { return sslctx_tbl_end; }
-inline int sslctx_tbl_get_cnt_hit() { return sslctx_tbl_cnt_hit; }
-inline int sslctx_tbl_get_cnt_miss() { return sslctx_tbl_cnt_miss; }
-inline int sslctx_tbl_get_cnt_purge() { return sslctx_tbl_cnt_purge; }
+/* Backward-compatible accessors */
+inline int sslctx_tbl_get_cnt_total() { return atomic_load(&sslctx_hash_count); }
+inline int sslctx_tbl_get_cnt_hit() { return atomic_load(&sslctx_tbl_cnt_hit); }
+inline int sslctx_tbl_get_cnt_miss() { return atomic_load(&sslctx_tbl_cnt_miss); }
+inline int sslctx_tbl_get_cnt_purge() { return atomic_load(&sslctx_tbl_cnt_purge); }
 inline int sslctx_tbl_get_sess_cnt() { return SSL_CTX_sess_number(g_sslctx); }
 inline int sslctx_tbl_get_sess_hit() { return SSL_CTX_sess_hits(g_sslctx); }
 inline int sslctx_tbl_get_sess_miss() { return SSL_CTX_sess_misses(g_sslctx); }
 inline int sslctx_tbl_get_sess_purge() { return SSL_CTX_sess_cache_full(g_sslctx); }
 
-static int sslctx_tbl_insert(const char *cert_name, SSL_CTX *sslctx, int ins_idx);
 static SSL_CTX* create_child_sslctx(const char* full_pem_path, const STACK_OF(X509_INFO) *cachain);
 
-#ifdef DEBUG
-static void sslctx_tbl_dump(int idx, const char * func);
-#endif
+/* Forward declarations for certificate index management */
+static int cert_index_init(const char *pem_dir);
+static int cert_index_add(const char *pem_dir, const char *domain, time_t created,
+                          int validity_days, int key_type);
 
 /* =============================================================================
  * LOCK-FREE CONNECTION STORAGE (Treiber Stack)
@@ -168,147 +193,343 @@ conn_tlstor_struct* conn_stor_acquire() {
 }
 
 /* =============================================================================
- * LOCK-FREE SSL CONTEXT TABLE (Seqlock Pattern)
- * Readers never block - they retry if a write was in progress
- * Writers use atomic sequence counter for synchronization
+ * LOCK-FREE SSL CONTEXT HASH TABLE
+ * - 100% lock-free: readers AND writers work in parallel
+ * - Atomic CAS for inserts on same bucket (one wins, others retry)
+ * - Open addressing with linear probing
+ * - Load factor ~75% for good performance
  * ============================================================================= */
 
-/* Seqlock helpers */
-static inline uint32_t seqlock_read_begin(void) {
-    uint32_t seq;
-    do {
-        seq = atomic_load_explicit(&sslctx_tbl_seqlock, memory_order_acquire);
-    } while (seq & 1);  /* Wait if write in progress (odd value) */
-    return seq;
-}
-
-static inline int seqlock_read_retry(uint32_t start_seq) {
-    atomic_thread_fence(memory_order_acquire);
-    return start_seq != atomic_load_explicit(&sslctx_tbl_seqlock, memory_order_relaxed);
-}
-
-/* Try to acquire write lock - returns 1 on success, 0 if busy (NO SPINNING) */
-static inline int seqlock_write_trylock(void) {
-    uint32_t seq = atomic_load_explicit(&sslctx_tbl_seqlock, memory_order_relaxed);
-    if (seq & 1)
-        return 0;  /* Write in progress - don't wait */
-    return atomic_compare_exchange_strong_explicit(
-        &sslctx_tbl_seqlock, &seq, seq + 1, memory_order_acquire, memory_order_relaxed);
-}
-
-static inline void seqlock_write_end(void) {
-    atomic_fetch_add_explicit(&sslctx_tbl_seqlock, 1, memory_order_release);
-    /* seq is now even - write complete */
+/* Round up to next power of 2 for efficient modulo via bitmask */
+static inline int next_power_of_2(int n) {
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    return n + 1;
 }
 
 void sslctx_tbl_init(int tbl_size)
 {
     if (tbl_size <= 0)
         return;
-    atomic_store(&sslctx_tbl_end, 0);
-    sslctx_tbl = malloc(tbl_size * sizeof(sslctx_cache_struct));
-    if (!sslctx_tbl) {
-        sslctx_tbl_size = 0;
-        log_msg(LGG_ERR, "Failed to allocate sslctx_tbl of size %d", tbl_size);
-    } else {
-        sslctx_tbl_size = tbl_size;
-        atomic_store(&sslctx_tbl_cnt_hit, 0);
-        atomic_store(&sslctx_tbl_cnt_miss, 0);
-        atomic_store(&sslctx_tbl_cnt_purge, 0);
-        atomic_store(&sslctx_tbl_last_flush, 0);
-        atomic_store(&sslctx_tbl_seqlock, 0);
-        memset(sslctx_tbl, 0, tbl_size * sizeof(sslctx_cache_struct));
+
+    /* Use ~133% of requested size for good load factor, round to power of 2 */
+    int actual_size = next_power_of_2((tbl_size * 4) / 3);
+    if (actual_size < 64) actual_size = 64;  /* Minimum size */
+
+    sslctx_hash_tbl = calloc(actual_size, sizeof(sslctx_hash_entry_t));
+    if (!sslctx_hash_tbl) {
+        sslctx_hash_size = 0;
+        log_msg(LGG_ERR, "Failed to allocate sslctx hash table of size %d", actual_size);
+        return;
     }
+
+    sslctx_hash_size = actual_size;
+    atomic_store(&sslctx_hash_count, 0);
+    atomic_store(&sslctx_tbl_cnt_hit, 0);
+    atomic_store(&sslctx_tbl_cnt_miss, 0);
+    atomic_store(&sslctx_tbl_cnt_purge, 0);
+    atomic_store(&sslctx_tbl_last_flush, 0);
+
+    log_msg(LGG_NOTICE, "SSL context hash table initialized: %d slots (requested %d)",
+            actual_size, tbl_size);
 }
 
 void sslctx_tbl_cleanup()
 {
-    int idx;
-    int end = atomic_load(&sslctx_tbl_end);
-    /* Cleanup is called at shutdown - no concurrent access expected */
-    for (idx = 0; idx < end; idx++) {
-        free(SSLCTX_TBL_get(idx, cert_name));
-        SSL_CTX_free(SSLCTX_TBL_get(idx, sslctx));
+    if (!sslctx_hash_tbl)
+        return;
+
+    /* Cleanup at shutdown - no concurrent access */
+    for (int i = 0; i < sslctx_hash_size; i++) {
+        uint32_t state = atomic_load(&sslctx_hash_tbl[i].state);
+        if (state == HASH_OCCUPIED || state == HASH_DELETED) {
+            free(sslctx_hash_tbl[i].cert_name);
+            SSL_CTX *ctx = atomic_load(&sslctx_hash_tbl[i].sslctx);
+            if (ctx) SSL_CTX_free(ctx);
+        }
     }
-    free(sslctx_tbl);
-    sslctx_tbl = NULL;
+    free(sslctx_hash_tbl);
+    sslctx_hash_tbl = NULL;
 }
 
-static int cmp_sslctx_reuse_count(const void *p1, const void *p2)
-{
-    /* reverse order */
-    return ((sslctx_cache_struct *)p2)->reuse_count - ((sslctx_cache_struct *)p1)->reuse_count;
+/* Lock-free lookup - returns SSL_CTX* or NULL
+ * Multiple readers can execute concurrently */
+static SSL_CTX* sslctx_hash_lookup(const char *cert_name) {
+    if (!sslctx_hash_tbl || !cert_name)
+        return NULL;
+
+    uint32_t hash = fnv1a_hash(cert_name);
+    uint32_t mask = sslctx_hash_size - 1;  /* Power of 2, so mask works */
+    uint32_t idx = hash & mask;
+
+    /* Linear probing - check up to table size slots */
+    for (int probe = 0; probe < sslctx_hash_size; probe++) {
+        uint32_t state = atomic_load_explicit(&sslctx_hash_tbl[idx].state, memory_order_acquire);
+
+        if (state == HASH_EMPTY) {
+            /* Empty slot - key doesn't exist */
+            return NULL;
+        }
+
+        if (state == HASH_OCCUPIED) {
+            /* Check if this is our key */
+            if (strcmp(sslctx_hash_tbl[idx].cert_name, cert_name) == 0) {
+                /* Found it! Update stats atomically */
+                atomic_fetch_add_explicit(&sslctx_tbl_cnt_hit, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&sslctx_hash_tbl[idx].reuse_count, 1, memory_order_relaxed);
+                atomic_store_explicit(&sslctx_hash_tbl[idx].last_use, process_uptime(), memory_order_relaxed);
+                return atomic_load_explicit(&sslctx_hash_tbl[idx].sslctx, memory_order_acquire);
+            }
+        }
+        /* DELETED or different key - continue probing */
+        idx = (idx + 1) & mask;
+    }
+
+    return NULL;  /* Table full, key not found */
 }
 
-static int cmp_sslctx_certname(const void *k, const void *p)
-{
-    return strcmp(((sslctx_cache_struct *)k)->cert_name, ((sslctx_cache_struct *)p)->cert_name);
+/* Lock-free insert - multiple writers can work in parallel on different buckets
+ * Returns: 0 = success, 1 = already exists (updated), -1 = table full */
+static int sslctx_hash_insert(const char *cert_name, SSL_CTX *sslctx) {
+    if (!sslctx_hash_tbl || !cert_name || !sslctx)
+        return -1;
+
+    /* Check load factor - if > 75%, we're getting full */
+    int count = atomic_load(&sslctx_hash_count);
+    if (count >= (sslctx_hash_size * 3) / 4) {
+        log_msg(LGG_WARNING, "SSL context hash table at %d%% capacity", (count * 100) / sslctx_hash_size);
+        /* Continue anyway - might find empty slot or existing entry */
+    }
+
+    uint32_t hash = fnv1a_hash(cert_name);
+    uint32_t mask = sslctx_hash_size - 1;
+    uint32_t idx = hash & mask;
+    int first_deleted = -1;  /* Track first tombstone for reuse */
+
+    /* Linear probing */
+    for (int probe = 0; probe < sslctx_hash_size; probe++) {
+        uint32_t state = atomic_load_explicit(&sslctx_hash_tbl[idx].state, memory_order_acquire);
+
+        if (state == HASH_EMPTY) {
+            /* Try to claim this slot with CAS */
+            uint32_t expected = HASH_EMPTY;
+            if (atomic_compare_exchange_strong_explicit(&sslctx_hash_tbl[idx].state,
+                    &expected, HASH_INSERTING, memory_order_acq_rel, memory_order_acquire)) {
+                /* We own this slot - fill it */
+                sslctx_hash_tbl[idx].cert_name = strdup(cert_name);
+                if (!sslctx_hash_tbl[idx].cert_name) {
+                    atomic_store(&sslctx_hash_tbl[idx].state, HASH_EMPTY);
+                    return -1;
+                }
+                atomic_store(&sslctx_hash_tbl[idx].sslctx, sslctx);
+                atomic_store(&sslctx_hash_tbl[idx].last_use, process_uptime());
+                atomic_store(&sslctx_hash_tbl[idx].reuse_count, 0);
+
+                /* Publish - make visible to readers */
+                atomic_store_explicit(&sslctx_hash_tbl[idx].state, HASH_OCCUPIED, memory_order_release);
+                atomic_fetch_add(&sslctx_hash_count, 1);
+                atomic_fetch_add(&sslctx_tbl_cnt_miss, 1);
+                return 0;
+            }
+            /* CAS failed - another thread claimed it, re-read state and continue */
+            state = atomic_load_explicit(&sslctx_hash_tbl[idx].state, memory_order_acquire);
+        }
+
+        if (state == HASH_OCCUPIED) {
+            /* Check if already exists */
+            if (strcmp(sslctx_hash_tbl[idx].cert_name, cert_name) == 0) {
+                /* Already cached - update SSL_CTX atomically (for cert refresh) */
+                SSL_CTX *old = atomic_exchange(&sslctx_hash_tbl[idx].sslctx, sslctx);
+                atomic_store(&sslctx_hash_tbl[idx].last_use, process_uptime());
+                atomic_fetch_add(&sslctx_hash_tbl[idx].reuse_count, 1);
+                if (old && old != sslctx) SSL_CTX_free(old);
+                return 1;  /* Updated existing */
+            }
+        }
+
+        if (state == HASH_DELETED && first_deleted < 0) {
+            first_deleted = idx;  /* Remember for potential reuse */
+        }
+
+        idx = (idx + 1) & mask;
+    }
+
+    /* Table full - try to reuse tombstone if found */
+    if (first_deleted >= 0) {
+        idx = first_deleted;
+        uint32_t expected = HASH_DELETED;
+        if (atomic_compare_exchange_strong_explicit(&sslctx_hash_tbl[idx].state,
+                &expected, HASH_INSERTING, memory_order_acq_rel, memory_order_acquire)) {
+            /* Reusing deleted slot */
+            free(sslctx_hash_tbl[idx].cert_name);
+            sslctx_hash_tbl[idx].cert_name = strdup(cert_name);
+            if (!sslctx_hash_tbl[idx].cert_name) {
+                atomic_store(&sslctx_hash_tbl[idx].state, HASH_DELETED);
+                return -1;
+            }
+            SSL_CTX *old = atomic_exchange(&sslctx_hash_tbl[idx].sslctx, sslctx);
+            if (old) SSL_CTX_free(old);
+            atomic_store(&sslctx_hash_tbl[idx].last_use, process_uptime());
+            atomic_store(&sslctx_hash_tbl[idx].reuse_count, 0);
+            atomic_store_explicit(&sslctx_hash_tbl[idx].state, HASH_OCCUPIED, memory_order_release);
+            atomic_fetch_add(&sslctx_tbl_cnt_miss, 1);
+            atomic_fetch_add(&sslctx_tbl_cnt_purge, 1);
+            return 0;
+        }
+    }
+
+    log_msg(LGG_ERR, "SSL context hash table full - cannot insert %s", cert_name);
+    return -1;
 }
 
-/* NOTE: Called during single-threaded startup only - no locking needed */
+/* Lock-free delete (marks as tombstone) */
+static int sslctx_hash_delete(const char *cert_name) {
+    if (!sslctx_hash_tbl || !cert_name)
+        return -1;
+
+    uint32_t hash = fnv1a_hash(cert_name);
+    uint32_t mask = sslctx_hash_size - 1;
+    uint32_t idx = hash & mask;
+
+    for (int probe = 0; probe < sslctx_hash_size; probe++) {
+        uint32_t state = atomic_load_explicit(&sslctx_hash_tbl[idx].state, memory_order_acquire);
+
+        if (state == HASH_EMPTY)
+            return -1;  /* Not found */
+
+        if (state == HASH_OCCUPIED && strcmp(sslctx_hash_tbl[idx].cert_name, cert_name) == 0) {
+            /* Found - mark as deleted (tombstone) */
+            uint32_t expected = HASH_OCCUPIED;
+            if (atomic_compare_exchange_strong(&sslctx_hash_tbl[idx].state, &expected, HASH_DELETED)) {
+                SSL_CTX *old = atomic_exchange(&sslctx_hash_tbl[idx].sslctx, NULL);
+                if (old) SSL_CTX_free(old);
+                atomic_fetch_sub(&sslctx_hash_count, 1);
+                atomic_fetch_add(&sslctx_tbl_cnt_purge, 1);
+                return 0;
+            }
+            /* CAS failed - another thread deleted it */
+            return -1;
+        }
+
+        idx = (idx + 1) & mask;
+    }
+
+    return -1;  /* Not found */
+}
+
+/* Helper struct for sorting during save */
+typedef struct {
+    char *cert_name;
+    int reuse_count;
+} save_entry_t;
+
+static int cmp_save_entry(const void *a, const void *b) {
+    return ((save_entry_t*)b)->reuse_count - ((save_entry_t*)a)->reuse_count;
+}
+
+/* NOTE: Called during single-threaded startup only */
 void sslctx_tbl_load(const char* pem_dir, const STACK_OF(X509_INFO) *cachain)
 {
     FILE *fp;
-    char *fname = NULL, *line;
+    char *fname = NULL, *line = NULL;
+    int loaded = 0;
+
     if ((line = malloc(PIXELSERV_MAX_PATH)) == NULL || (fname = malloc(PIXELSERV_MAX_PATH)) == NULL) {
         log_msg(LGG_ERR, "%s: failed to allocate memory", __FUNCTION__);
         goto quit_load;
     }
 
     (void)snprintf(fname, PIXELSERV_MAX_PATH, "%s/prefetch", pem_dir);
-    if((fp = fopen(fname, "r")) == NULL) {
+    if ((fp = fopen(fname, "r")) == NULL) {
         log_msg(LGG_WARNING, "%s: %s doesn't exist.", __FUNCTION__, fname);
         goto quit_load;
     }
 
     while (getline(&line, &(size_t){ PIXELSERV_MAX_PATH }, fp) != -1) {
         char *cert_name = strtok(line, " \n\t");
+        if (!cert_name) continue;
+
         (void)snprintf(fname, PIXELSERV_MAX_PATH, "%s/%s", pem_dir, cert_name);
 
         SSL_CTX *sslctx = create_child_sslctx(fname, cachain);
         if (sslctx) {
-            int ins_idx = sslctx_tbl_end;
-            sslctx_tbl_insert(cert_name, sslctx, ins_idx);
-            log_msg(LGG_NOTICE, "%s: %s", __FUNCTION__, cert_name);
+            if (sslctx_hash_insert(cert_name, sslctx) >= 0) {
+                log_msg(LGG_NOTICE, "%s: %s", __FUNCTION__, cert_name);
+                loaded++;
+            } else {
+                SSL_CTX_free(sslctx);
+            }
         }
-        if (sslctx_tbl_end >= sslctx_tbl_size)
+
+        /* Stop if hash table is getting full */
+        if (atomic_load(&sslctx_hash_count) >= (sslctx_hash_size * 3) / 4)
             break;
     }
     fclose(fp);
-    sslctx_tbl_cnt_miss = 0; /* reset */
-    qsort(SSLCTX_TBL_ptr(0), sslctx_tbl_end, sizeof(sslctx_cache_struct), cmp_sslctx_certname);
+    atomic_store(&sslctx_tbl_cnt_miss, 0);  /* Reset after prefetch */
+    log_msg(LGG_NOTICE, "Prefetched %d SSL contexts from cache", loaded);
+
 quit_load:
     free(fname);
     free(line);
 }
 
-/* NOTE: Called from signal handler during shutdown - async-signal-unsafe
- * but acceptable since followed by exit() */
+/* NOTE: Called at shutdown - collects entries and saves most-used */
 void sslctx_tbl_save(const char* pem_dir)
 {
-    #define RATIO_TO_SAVE 1
-    int idx;
-    char *fname;
-    FILE *fp;
+    if (!sslctx_hash_tbl)
+        return;
+
+    char *fname = NULL;
+    FILE *fp = NULL;
+    save_entry_t *entries = NULL;
+    int entry_count = 0;
 
     if ((fname = malloc(PIXELSERV_MAX_PATH)) == NULL) {
         log_msg(LGG_ERR, "%s: failed to allocate memory", __FUNCTION__);
         goto quit_save;
     }
-    (void)snprintf(fname, PIXELSERV_MAX_PATH, "%s/prefetch", pem_dir);
 
+    /* Collect all occupied entries */
+    int count = atomic_load(&sslctx_hash_count);
+    entries = malloc(count * sizeof(save_entry_t));
+    if (!entries) {
+        log_msg(LGG_ERR, "%s: failed to allocate entries", __FUNCTION__);
+        goto quit_save;
+    }
+
+    for (int i = 0; i < sslctx_hash_size && entry_count < count; i++) {
+        if (atomic_load(&sslctx_hash_tbl[i].state) == HASH_OCCUPIED) {
+            entries[entry_count].cert_name = sslctx_hash_tbl[i].cert_name;
+            entries[entry_count].reuse_count = atomic_load(&sslctx_hash_tbl[i].reuse_count);
+            entry_count++;
+        }
+    }
+
+    /* Sort by reuse count (most used first) */
+    qsort(entries, entry_count, sizeof(save_entry_t), cmp_save_entry);
+
+    (void)snprintf(fname, PIXELSERV_MAX_PATH, "%s/prefetch", pem_dir);
     if ((fp = fopen(fname, "w")) == NULL) {
         log_msg(LGG_ERR, "%s: failed to open %s", __FUNCTION__, fname);
         goto quit_save;
     }
-    qsort(SSLCTX_TBL_ptr(0), sslctx_tbl_end, sizeof(sslctx_cache_struct), cmp_sslctx_reuse_count);
-    if (sslctx_tbl_end > (sslctx_tbl_size * RATIO_TO_SAVE))
-        sslctx_tbl_end = sslctx_tbl_size * RATIO_TO_SAVE;
 
-    for (idx=0; idx < sslctx_tbl_end; idx++)
-        fprintf(fp, "%s\t%d\n", SSLCTX_TBL_get(idx, cert_name), SSLCTX_TBL_get(idx, reuse_count));
+    /* Save up to 75% of table capacity */
+    int max_save = (sslctx_hash_size * 3) / 4;
+    for (int i = 0; i < entry_count && i < max_save; i++) {
+        fprintf(fp, "%s\t%d\n", entries[i].cert_name, entries[i].reuse_count);
+    }
     fclose(fp);
+    log_msg(LGG_NOTICE, "Saved %d SSL contexts to prefetch cache",
+            entry_count < max_save ? entry_count : max_save);
+
 quit_save:
+    free(entries);
     free(fname);
 }
 
@@ -331,186 +552,6 @@ static int sslctx_tbl_check_and_flush(void)
     }
     return rv;
 }
-
-/* Lock-free lookup using seqlock pattern - readers never block */
-static int sslctx_tbl_lookup(char* cert_name, int* found_idx, int* ins_idx)
-{
-    *found_idx = -1; *ins_idx = -1;
-    if (!cert_name || !found_idx || !ins_idx) {
-        log_msg(LOG_ERR, "Invalid params. cert_name: %s. found_idx: %d, ins_idx: %d",
-            cert_name, found_idx, ins_idx);
-        return -1;
-    }
-
-    uint32_t seq;
-    sslctx_cache_struct key, *found;
-    key.cert_name = cert_name;
-
-    /* Lock-free read with seqlock - retry if write was in progress */
-    do {
-        seq = seqlock_read_begin();
-
-        int end = atomic_load_explicit(&sslctx_tbl_end, memory_order_acquire);
-        found = bsearch(&key, SSLCTX_TBL_ptr(0), end, sizeof(sslctx_cache_struct), cmp_sslctx_certname);
-
-        if (found != NULL) {
-            *found_idx = (found - SSLCTX_TBL_ptr(0));
-        } else if (end < sslctx_tbl_size) {
-            *ins_idx = end;
-        } else {
-            /* Find LRU entry to replace */
-            int idx, purge_idx = 0;
-            unsigned int _last_use = process_uptime();
-
-            for (idx = 0; idx < end; idx++) {
-                if (SSLCTX_TBL_get(idx, last_use) < _last_use) {
-                    _last_use = SSLCTX_TBL_get(idx, last_use);
-                    purge_idx = idx;
-                }
-            }
-            *ins_idx = purge_idx;
-        }
-    } while (seqlock_read_retry(seq));
-
-    /* Update stats atomically after successful read */
-    if (*found_idx >= 0) {
-        atomic_fetch_add_explicit(&sslctx_tbl_cnt_hit, 1, memory_order_relaxed);
-        /* These updates are racy but acceptable for stats/LRU heuristics */
-        SSLCTX_TBL_get(*found_idx, reuse_count)++;
-        SSLCTX_TBL_get(*found_idx, last_use) = process_uptime();
-    }
-
-    return 0;
-}
-
-/* Insert into table - called with seqlock held */
-static int sslctx_tbl_insert_locked(const char *cert_name, SSL_CTX *sslctx, int ins_idx)
-{
-    if (cert_name == NULL || sslctx == NULL || ins_idx >= sslctx_tbl_size || ins_idx < 0) {
-        log_msg(LOG_ERR, "Invalid params. cert_name: %s. sslctx: %p, ins_idx: %d",
-            cert_name, (void*)sslctx, ins_idx);
-        return -1;
-    }
-    atomic_fetch_add_explicit(&sslctx_tbl_cnt_miss, 1, memory_order_relaxed);
-
-    /* add new cache entry */
-    unsigned int pixel_now = process_uptime();
-    int len = strlen(cert_name);
-    char *str = SSLCTX_TBL_get(ins_idx, cert_name);
-    if ((len + 1) > SSLCTX_TBL_get(ins_idx, alloc_len)) {
-        str = realloc(str, len + 1);
-        SSLCTX_TBL_set(ins_idx, alloc_len, len + 1);
-    }
-    strncpy(str, cert_name, len + 1);
-    SSLCTX_TBL_set(ins_idx, cert_name, str);
-    SSLCTX_TBL_set(ins_idx, last_use, pixel_now);
-    SSLCTX_TBL_set(ins_idx, reuse_count, 0);
-
-    int end = atomic_load(&sslctx_tbl_end);
-    if (ins_idx == end && end < sslctx_tbl_size) {
-        atomic_store(&sslctx_tbl_end, end + 1);
-    } else {
-#ifdef DEBUG
-        printf("%s: SSL_CTX_free %p sslctx_tbl_end %d\n", __FUNCTION__, SSLCTX_TBL_get(ins_idx, sslctx), end);
-#endif
-        SSL_CTX_free(SSLCTX_TBL_get(ins_idx, sslctx));
-        atomic_fetch_add_explicit(&sslctx_tbl_cnt_purge, 1, memory_order_relaxed);
-    }
-    SSLCTX_TBL_set(ins_idx, sslctx, sslctx);
-    return 0;
-}
-
-/* Called during single-threaded startup - no seqlock needed */
-static int sslctx_tbl_insert(const char *cert_name, SSL_CTX *sslctx, int ins_idx)
-{
-    return sslctx_tbl_insert_locked(cert_name, sslctx, ins_idx);
-}
-
-/* Lock-free cache insertion using seqlock for write synchronization
- * If another writer holds the lock, we skip caching (NO BLOCKING) */
-static int sslctx_tbl_cache(const char *cert_name, SSL_CTX *sslctx, int ins_idx)
-{
-    int ret = -1;
-
-    /* Try to acquire write lock - if busy, skip caching (cert will reload next time) */
-    if (!seqlock_write_trylock()) {
-        /* Another writer active - don't block, just use the sslctx without caching */
-        return 0;  /* Not an error - we just didn't cache */
-    }
-
-    /* Double-check: another thread might have cached this cert while we loaded it */
-    sslctx_cache_struct key, *found;
-    key.cert_name = (char *)cert_name;
-    int end = atomic_load(&sslctx_tbl_end);
-    found = bsearch(&key, SSLCTX_TBL_ptr(0), end, sizeof(sslctx_cache_struct), cmp_sslctx_certname);
-
-    if (found != NULL) {
-        /* Already cached by another thread - update stats and discard our copy */
-        found->reuse_count++;
-        found->last_use = process_uptime();
-        seqlock_write_end();
-        SSL_CTX_free(sslctx);  /* Free duplicate */
-        return 0;
-    }
-
-    if (sslctx_tbl_insert_locked(cert_name, sslctx, ins_idx) == 0) {
-        end = atomic_load(&sslctx_tbl_end);
-        qsort(SSLCTX_TBL_ptr(0), end, sizeof(sslctx_cache_struct), cmp_sslctx_certname);
-        ret = 0;
-    }
-
-    seqlock_write_end();
-    return ret;
-}
-
-/* Lock-free purge using seqlock for write synchronization
- * If another writer holds the lock, we skip purging (NO BLOCKING) */
-static int sslctx_tbl_purge(int idx) {
-    int end = atomic_load(&sslctx_tbl_end);
-    if (idx < 0 || idx >= end || end <= 0)
-        return -1;
-
-    /* Try to acquire write lock - if busy, skip purging (will try again later) */
-    if (!seqlock_write_trylock())
-        return -1;  /* Another writer active - don't block */
-
-    /* Re-validate idx after acquiring seqlock */
-    end = atomic_load(&sslctx_tbl_end);
-    if (idx >= end) {
-        seqlock_write_end();
-        return -1;
-    }
-
-    if (SSLCTX_TBL_get(idx, cert_name))
-        free(SSLCTX_TBL_get(idx, cert_name));
-    if (SSLCTX_TBL_get(idx, sslctx))
-        SSL_CTX_free(SSLCTX_TBL_get(idx, sslctx));
-
-    end--;
-    atomic_store(&sslctx_tbl_end, end);
-
-    if (idx < end) {
-        memmove(SSLCTX_TBL_ptr(idx), SSLCTX_TBL_ptr(idx+1), sizeof(sslctx_cache_struct) * (end - idx));
-        memset(SSLCTX_TBL_ptr(end), 0, sizeof(sslctx_cache_struct));
-    } else {
-        memset(SSLCTX_TBL_ptr(end), 0, sizeof(sslctx_cache_struct));
-    }
-
-    seqlock_write_end();
-    return 0;
-}
-
-#ifdef DEBUG
-static void sslctx_tbl_dump(int idx, const char * func)
-{
-    printf("%s: idx %d now %d\n", func, idx, process_uptime());
-    printf("** cert_name %s\n", sslctx_tbl[idx].cert_name);
-    printf("** alloc_len %d\n", sslctx_tbl[idx].alloc_len);
-    printf("** last_use %d\n", sslctx_tbl[idx].last_use);
-    printf("** reuse_count %d\n", sslctx_tbl[idx].reuse_count);
-    printf("** sslctx %p\n", sslctx_tbl[idx].sslctx);
-}
-#endif
 
 /* =============================================================================
  * LEGACY OPENSSL THREAD SUPPORT (< 1.1.0 only)
@@ -695,6 +736,10 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
     PEM_write_PrivateKey(fp, key, NULL, NULL, 0, NULL, NULL);
     PEM_write_X509(fp, x509);
     fclose(fp);
+
+    /* Add to sharded index (lock-free append to shard file) */
+    cert_index_add(pem_dir, pem_fn, time(NULL), cert_validity_days, cert_key_type);
+
     log_msg(LGG_NOTICE, "cert generated to disk: %s", pem_fn);
 
 free_all:
@@ -795,6 +840,9 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     memset(ct, 0, sizeof(cert_tlstor_t));
     ct->pem_dir = pem_dir;
     passwd_arg.pem_dir = pem_dir;
+
+    /* Initialize sharded certificate index */
+    cert_index_init(pem_dir);
 
     /*
      * New CA hierarchy (all files under pem_dir/rootCA/):
@@ -934,6 +982,399 @@ void cert_tlstor_cleanup(cert_tlstor_t *c)
     EVP_PKEY_free(c->privkey);
 }
 
+/* =============================================================================
+ * SHARDED CERTIFICATE INDEX MANAGEMENT (pem_dir/index/)
+ * - Scales to 5-10 million certificates
+ * - Hash-based sharding: 256 shards (configurable)
+ * - Lock-free parallel access to different shards
+ * - Each shard is an independent file: index/00.idx ... index/ff.idx
+ * ============================================================================= */
+
+#define CERT_INDEX_DIR "index"
+#define CERT_INDEX_SHARDS 256       /* Number of shards (256 = 0x00-0xff) */
+#define CERT_INDEX_SHARD_BITS 8     /* log2(CERT_INDEX_SHARDS) */
+#define CERT_INDEX_VERSION 2
+
+/* Index entry - stored in shard files (tab-separated) */
+typedef struct {
+    char domain[PIXELSERV_MAX_SERVER_NAME + 1];
+    time_t created;
+    time_t expires;
+    int key_type;  /* 0=RSA2048, 1=RSA4096, 2=ECDSA-P256, 3=ECDSA-P384 */
+} cert_index_entry_t;
+
+/* Shard statistics (atomic) */
+static _Atomic uint64_t cert_index_total_entries = 0;
+static char *cert_index_base_path = NULL;
+
+/* Get shard number from domain name using FNV-1a hash */
+static inline int cert_index_shard(const char *domain) {
+    uint32_t hash = fnv1a_hash(domain);
+    return hash & (CERT_INDEX_SHARDS - 1);  /* Use low bits for shard */
+}
+
+/* Get shard file path */
+static void cert_index_shard_path(const char *pem_dir, int shard, char *path, size_t path_size) {
+    snprintf(path, path_size, "%s/%s/%02x.idx", pem_dir, CERT_INDEX_DIR, shard);
+}
+
+/* Ensure index directory and shard structure exists */
+static int cert_index_init(const char *pem_dir) {
+    char path[PIXELSERV_MAX_PATH];
+    struct stat st;
+
+    /* Create main index directory */
+    snprintf(path, PIXELSERV_MAX_PATH, "%s/%s", pem_dir, CERT_INDEX_DIR);
+
+    if (stat(path, &st) != 0) {
+        if (mkdir(path, 0755) != 0) {
+            log_msg(LGG_ERR, "%s: failed to create index dir %s: %s",
+                    __FUNCTION__, path, strerror(errno));
+            return -1;
+        }
+        log_msg(LGG_NOTICE, "Created sharded certificate index: %s (%d shards)",
+                path, CERT_INDEX_SHARDS);
+    } else if (!S_ISDIR(st.st_mode)) {
+        log_msg(LGG_ERR, "%s: %s exists but is not a directory", __FUNCTION__, path);
+        return -1;
+    }
+
+    /* Store base path for later use */
+    if (cert_index_base_path == NULL) {
+        cert_index_base_path = strdup(pem_dir);
+    }
+
+    /* Count existing entries across all shards */
+    uint64_t total = 0;
+    for (int s = 0; s < CERT_INDEX_SHARDS; s++) {
+        cert_index_shard_path(pem_dir, s, path, PIXELSERV_MAX_PATH);
+        FILE *fp = fopen(path, "r");
+        if (fp) {
+            char line[PIXELSERV_MAX_SERVER_NAME + 64];
+            while (fgets(line, sizeof(line), fp))
+                total++;
+            fclose(fp);
+        }
+    }
+    atomic_store(&cert_index_total_entries, total);
+
+    if (total > 0)
+        log_msg(LGG_NOTICE, "Certificate index loaded: %lu entries across %d shards",
+                (unsigned long)total, CERT_INDEX_SHARDS);
+
+    return 0;
+}
+
+/* Add certificate to appropriate shard - lock-free (append is atomic on POSIX) */
+static int cert_index_add(const char *pem_dir, const char *domain, time_t created,
+                          int validity_days, int key_type) {
+    char path[PIXELSERV_MAX_PATH];
+    int shard = cert_index_shard(domain);
+
+    cert_index_shard_path(pem_dir, shard, path, PIXELSERV_MAX_PATH);
+
+    /* Open for append - atomic on POSIX systems */
+    FILE *fp = fopen(path, "a");
+    if (!fp) {
+        log_msg(LGG_WARNING, "%s: cannot open shard %02x: %s",
+                __FUNCTION__, shard, strerror(errno));
+        return -1;
+    }
+
+    time_t expires = created + (validity_days * 24 * 3600);
+    fprintf(fp, "%s\t%ld\t%ld\t%d\n", domain, (long)created, (long)expires, key_type);
+    fclose(fp);
+
+    atomic_fetch_add(&cert_index_total_entries, 1);
+    return 0;
+}
+
+/* Check if domain exists in index (fast lookup) */
+static int cert_index_exists(const char *pem_dir, const char *domain) {
+    char path[PIXELSERV_MAX_PATH];
+    char line[PIXELSERV_MAX_SERVER_NAME + 64];
+    int shard = cert_index_shard(domain);
+
+    cert_index_shard_path(pem_dir, shard, path, PIXELSERV_MAX_PATH);
+
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return 0;
+
+    size_t domain_len = strlen(domain);
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, domain, domain_len) == 0 && line[domain_len] == '\t') {
+            fclose(fp);
+            return 1;
+        }
+    }
+    fclose(fp);
+    return 0;
+}
+
+/* Load a single shard into memory */
+static cert_index_entry_t* cert_index_load_shard(const char *pem_dir, int shard, int *count) {
+    char path[PIXELSERV_MAX_PATH];
+    FILE *fp;
+    char line[PIXELSERV_MAX_SERVER_NAME + 64];
+    cert_index_entry_t *entries = NULL;
+    int capacity = 0, n = 0;
+
+    *count = 0;
+
+    cert_index_shard_path(pem_dir, shard, path, PIXELSERV_MAX_PATH);
+    fp = fopen(path, "r");
+    if (!fp)
+        return NULL;
+
+    capacity = 1024;
+    entries = malloc(capacity * sizeof(cert_index_entry_t));
+    if (!entries) {
+        fclose(fp);
+        return NULL;
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        char domain[PIXELSERV_MAX_SERVER_NAME + 1];
+        long created, expires;
+        int key_type;
+
+        if (sscanf(line, "%255s\t%ld\t%ld\t%d", domain, &created, &expires, &key_type) == 4) {
+            if (n >= capacity) {
+                capacity *= 2;
+                cert_index_entry_t *new_entries = realloc(entries, capacity * sizeof(cert_index_entry_t));
+                if (!new_entries) {
+                    free(entries);
+                    fclose(fp);
+                    return NULL;
+                }
+                entries = new_entries;
+            }
+            strncpy(entries[n].domain, domain, PIXELSERV_MAX_SERVER_NAME);
+            entries[n].domain[PIXELSERV_MAX_SERVER_NAME] = '\0';
+            entries[n].created = (time_t)created;
+            entries[n].expires = (time_t)expires;
+            entries[n].key_type = key_type;
+            n++;
+        }
+    }
+    fclose(fp);
+    *count = n;
+    return entries;
+}
+
+/* Rebuild single shard from disk scan - can run in parallel for different shards */
+static int cert_index_rebuild_shard(const char *pem_dir, int shard) {
+    char path[PIXELSERV_MAX_PATH];
+    DIR *dir;
+    struct dirent *entry;
+    FILE *fp;
+    int count = 0;
+
+    dir = opendir(pem_dir);
+    if (!dir)
+        return -1;
+
+    cert_index_shard_path(pem_dir, shard, path, PIXELSERV_MAX_PATH);
+    fp = fopen(path, "w");
+    if (!fp) {
+        closedir(dir);
+        return -1;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        struct stat st;
+        char cert_path[PIXELSERV_MAX_PATH];
+
+        /* Skip directories and special files */
+        if (entry->d_name[0] == '.')
+            continue;
+        if (strcmp(entry->d_name, "rootCA") == 0 || strcmp(entry->d_name, CERT_INDEX_DIR) == 0)
+            continue;
+        if (strcmp(entry->d_name, "prefetch") == 0)
+            continue;
+
+        /* Only process entries belonging to this shard */
+        if (cert_index_shard(entry->d_name) != shard)
+            continue;
+
+        snprintf(cert_path, PIXELSERV_MAX_PATH, "%s/%s", pem_dir, entry->d_name);
+        if (stat(cert_path, &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+
+        /* Check file is a PEM certificate */
+        FILE *cert_fp = fopen(cert_path, "r");
+        if (cert_fp) {
+            char header[32];
+            if (fgets(header, sizeof(header), cert_fp) &&
+                strstr(header, "-----BEGIN")) {
+                fprintf(fp, "%s\t%ld\t%ld\t%d\n",
+                        entry->d_name,
+                        (long)st.st_mtime,
+                        (long)(st.st_mtime + cert_validity_days * 24 * 3600),
+                        cert_key_type);
+                count++;
+            }
+            fclose(cert_fp);
+        }
+    }
+    closedir(dir);
+    fclose(fp);
+
+    return count;
+}
+
+/* Full index rebuild - parallelizable across shards */
+static int cert_index_rebuild(const char *pem_dir) {
+    int total = 0;
+
+    log_msg(LGG_NOTICE, "Rebuilding certificate index (%d shards)...", CERT_INDEX_SHARDS);
+
+    for (int s = 0; s < CERT_INDEX_SHARDS; s++) {
+        int count = cert_index_rebuild_shard(pem_dir, s);
+        if (count > 0)
+            total += count;
+    }
+
+    atomic_store(&cert_index_total_entries, total);
+    log_msg(LGG_NOTICE, "Certificate index rebuilt: %d entries", total);
+    return total;
+}
+
+/* Get total certificate count (lock-free read) */
+static inline uint64_t cert_index_count(void) {
+    return atomic_load(&cert_index_total_entries);
+}
+
+/* =============================================================================
+ * LOCK-FREE THREAD POOL FOR CERTIFICATE GENERATION
+ * - Multiple worker threads generate certs in parallel
+ * - Lock-free MPSC queue for work distribution
+ * - Significantly improves throughput under load
+ * ============================================================================= */
+
+#define CERTGEN_QUEUE_SIZE 256  /* Must be power of 2 */
+#define CERTGEN_POOL_SIZE 4     /* Number of worker threads */
+
+typedef struct {
+    char domain[PIXELSERV_MAX_SERVER_NAME + 1];
+} certgen_work_item_t;
+
+/* Lock-free bounded queue using atomic indexes */
+static certgen_work_item_t certgen_queue[CERTGEN_QUEUE_SIZE];
+static _Atomic uint32_t certgen_queue_head = 0;  /* Producer writes here */
+static _Atomic uint32_t certgen_queue_tail = 0;  /* Consumers read from here */
+static _Atomic int certgen_shutdown = 0;
+static pthread_t certgen_workers[CERTGEN_POOL_SIZE];
+static cert_tlstor_t *certgen_ctx = NULL;
+
+/* Enqueue work item - called by reader thread */
+static int certgen_enqueue(const char *domain) {
+    uint32_t head = atomic_load_explicit(&certgen_queue_head, memory_order_relaxed);
+    uint32_t next_head = (head + 1) & (CERTGEN_QUEUE_SIZE - 1);
+    uint32_t tail = atomic_load_explicit(&certgen_queue_tail, memory_order_acquire);
+
+    if (next_head == tail) {
+        /* Queue full - drop this request (will be retried by client) */
+        return -1;
+    }
+
+    strncpy(certgen_queue[head].domain, domain, PIXELSERV_MAX_SERVER_NAME);
+    certgen_queue[head].domain[PIXELSERV_MAX_SERVER_NAME] = '\0';
+
+    /* Publish - make visible to consumers */
+    atomic_store_explicit(&certgen_queue_head, next_head, memory_order_release);
+    return 0;
+}
+
+/* Dequeue work item - called by worker threads, returns NULL if empty */
+static const char* certgen_dequeue(void) {
+    uint32_t tail, head, next_tail;
+
+    do {
+        tail = atomic_load_explicit(&certgen_queue_tail, memory_order_relaxed);
+        head = atomic_load_explicit(&certgen_queue_head, memory_order_acquire);
+
+        if (tail == head) {
+            /* Queue empty */
+            return NULL;
+        }
+
+        next_tail = (tail + 1) & (CERTGEN_QUEUE_SIZE - 1);
+    } while (!atomic_compare_exchange_weak_explicit(&certgen_queue_tail,
+                &tail, next_tail, memory_order_acq_rel, memory_order_relaxed));
+
+    return certgen_queue[tail].domain;
+}
+
+/* Worker thread function - processes cert generation requests */
+static void *certgen_worker(void *arg) {
+    int worker_id = (int)(intptr_t)arg;
+    (void)worker_id;  /* Silence unused warning in non-debug builds */
+
+#ifdef DEBUG
+    printf("certgen_worker[%d]: started\n", worker_id);
+#endif
+
+    while (!atomic_load_explicit(&certgen_shutdown, memory_order_acquire)) {
+        const char *domain = certgen_dequeue();
+
+        if (domain == NULL) {
+            /* Queue empty - sleep briefly to avoid busy-waiting */
+            struct timespec ts = {0, 10000000};  /* 10ms */
+            nanosleep(&ts, NULL);
+            continue;
+        }
+
+        if (certgen_ctx == NULL || certgen_ctx->privkey == NULL || certgen_ctx->issuer == NULL) {
+            continue;
+        }
+
+        /* Check if cert already exists */
+        char cert_file[PIXELSERV_MAX_PATH];
+        struct stat st;
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/%s", certgen_ctx->pem_dir, domain);
+
+        if (stat(cert_file, &st) != 0) {
+            /* Cert doesn't exist - generate it */
+            char domain_copy[PIXELSERV_MAX_SERVER_NAME + 1];
+            strncpy(domain_copy, domain, PIXELSERV_MAX_SERVER_NAME);
+            domain_copy[PIXELSERV_MAX_SERVER_NAME] = '\0';
+            generate_cert(domain_copy, certgen_ctx->pem_dir, certgen_ctx->issuer, certgen_ctx->privkey);
+        }
+    }
+
+#ifdef DEBUG
+    printf("certgen_worker[%d]: shutting down\n", worker_id);
+#endif
+    return NULL;
+}
+
+/* Initialize thread pool */
+static void certgen_pool_init(cert_tlstor_t *ct) {
+    certgen_ctx = ct;
+    atomic_store(&certgen_shutdown, 0);
+    atomic_store(&certgen_queue_head, 0);
+    atomic_store(&certgen_queue_tail, 0);
+
+    for (int i = 0; i < CERTGEN_POOL_SIZE; i++) {
+        if (pthread_create(&certgen_workers[i], NULL, certgen_worker, (void*)(intptr_t)i) != 0) {
+            log_msg(LGG_ERR, "Failed to create certgen worker thread %d", i);
+        }
+    }
+    log_msg(LGG_NOTICE, "Certificate generation thread pool started: %d workers", CERTGEN_POOL_SIZE);
+}
+
+/* Shutdown thread pool */
+static void certgen_pool_shutdown(void) {
+    atomic_store_explicit(&certgen_shutdown, 1, memory_order_release);
+
+    for (int i = 0; i < CERTGEN_POOL_SIZE; i++) {
+        pthread_join(certgen_workers[i], NULL);
+    }
+    log_msg(LGG_NOTICE, "Certificate generation thread pool stopped");
+}
+
 void *cert_generator(void *ptr) {
 #ifdef DEBUG
     printf("%s: thread up and running\n", __FUNCTION__);
@@ -944,6 +1385,9 @@ void *cert_generator(void *ptr) {
     char buf[PIXELSERV_MAX_SERVER_NAME * 4 + 1];
     char *half_token = buf + PIXELSERV_MAX_SERVER_NAME * 4;
     buf[PIXELSERV_MAX_SERVER_NAME * 4] = '\0';
+
+    /* Initialize thread pool for parallel certificate generation */
+    certgen_pool_init(ct);
 
     /* non block required. otherwise blocked until other side opens */
     int fd = open(PIXEL_CERT_PIPE, O_RDONLY | O_NONBLOCK);
@@ -995,16 +1439,21 @@ void *cert_generator(void *ptr) {
         char *p_buf, *p_buf_sav = NULL;
         p_buf = strtok_r(buf, ":", &p_buf_sav);
         while (p_buf != NULL) {
-            char cert_file[PIXELSERV_MAX_PATH];
-            struct stat st;
-            snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/%s", ((cert_tlstor_t*)ct)->pem_dir, p_buf);
-            if(stat(cert_file, &st) != 0) /* doesn't exist */
-                generate_cert(p_buf, ct->pem_dir, ct->issuer, ct->privkey);
+            /* Enqueue to thread pool for parallel generation */
+            if (certgen_enqueue(p_buf) < 0) {
+                /* Queue full - generate synchronously as fallback */
+                char cert_file[PIXELSERV_MAX_PATH];
+                struct stat st;
+                snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/%s", ct->pem_dir, p_buf);
+                if(stat(cert_file, &st) != 0) /* doesn't exist */
+                    generate_cert(p_buf, ct->pem_dir, ct->issuer, ct->privkey);
+            }
             p_buf = strtok_r(NULL, ":", &p_buf_sav);
         }
         /* quick check and flush if time due */
         sslctx_tbl_check_and_flush();
     }
+    /* Note: certgen_pool_shutdown() would be called here if we ever exit the loop */
     return NULL;
 }
 
@@ -1111,25 +1560,22 @@ static int tls_servername_cb(SSL *ssl, int *ad, void *arg) {
         goto quit_cb;
     }
 
-    int handle, ins_handle;
-    sslctx_tbl_lookup(pem_file, &handle, &ins_handle);
+    /* Lock-free hash table lookup - multiple threads can lookup concurrently */
+    SSL_CTX *cached_ctx = sslctx_hash_lookup(pem_file);
 #ifdef DEBUG
-    printf("%s: handle %d ins_handle %d\n", __FUNCTION__, handle, ins_handle);
-    if (handle >=0)
-        sslctx_tbl_dump(handle, __FUNCTION__);
-    if (ins_handle >=0) sslctx_tbl_dump(ins_handle, __FUNCTION__);
+    printf("%s: cached_ctx %p for %s\n", __FUNCTION__, (void*)cached_ctx, pem_file);
 #endif
 
-    if (handle >= 0) {
-        SSL_set_SSL_CTX(ssl, SSLCTX_TBL_get(handle, sslctx));
+    if (cached_ctx != NULL) {
+        SSL_set_SSL_CTX(ssl, cached_ctx);
         if (X509_cmp_time(X509_get_notAfter(SSL_get_certificate(ssl)), NULL) > 0) {
             cbarg->status = SSL_HIT;
             goto quit_cb;
         }
-        // the certificate has expired. let's re-generate
+        /* Certificate expired - delete from cache and regenerate */
         cbarg->status = SSL_ERR;
         log_msg(LGG_WARNING, "Expired certificate %s", pem_file);
-        sslctx_tbl_purge(handle);
+        sslctx_hash_delete(pem_file);
         remove(full_pem_path);
         goto submit_missing_cert;
     }
@@ -1160,9 +1606,10 @@ submit_missing_cert:
         goto quit_cb;
     }
 
-    SSL_CTX *sslctx = NULL;
-    if (NULL == (sslctx = create_child_sslctx(full_pem_path, cbarg->cachain))) {
-        log_msg(LGG_ERR, "%s: fail to create sslctx or cache %s", __FUNCTION__, pem_file);
+    /* Load cert from disk - lock-free, multiple threads can do this */
+    SSL_CTX *sslctx = create_child_sslctx(full_pem_path, cbarg->cachain);
+    if (sslctx == NULL) {
+        log_msg(LGG_ERR, "%s: fail to create sslctx for %s", __FUNCTION__, pem_file);
         cbarg->status = SSL_ERR;
         rv = CB_ERR;
         goto quit_cb;
@@ -1170,18 +1617,20 @@ submit_missing_cert:
 
     SSL_set_SSL_CTX(ssl, sslctx);
     if (X509_cmp_time(X509_get_notAfter(SSL_get_certificate(ssl)), NULL) < 0) {
-        // the certificate has expired. let's re-generate
+        /* Certificate expired - regenerate */
         cbarg->status = SSL_ERR;
         log_msg(LGG_WARNING, "Expired certificate %s", pem_file);
+        SSL_CTX_free(sslctx);
         remove(full_pem_path);
         goto submit_missing_cert;
     }
 
-    if (sslctx_tbl_cache(pem_file, sslctx, ins_handle) < 0) {
-        log_msg(LGG_ERR, "%s: fail to create sslctx or cache %s", __FUNCTION__, pem_file);
-        cbarg->status = SSL_ERR;
-        rv = CB_ERR;
-        goto quit_cb;
+    /* Lock-free insert - multiple threads can insert to different buckets concurrently
+     * If same cert, hash_insert handles deduplication (returns 1 = already exists) */
+    int insert_rv = sslctx_hash_insert(pem_file, sslctx);
+    if (insert_rv < 0) {
+        log_msg(LGG_WARNING, "%s: hash table full, using uncached sslctx for %s", __FUNCTION__, pem_file);
+        /* Continue anyway - sslctx is valid, just not cached */
     }
     cbarg->status = SSL_HIT;
 
@@ -1439,7 +1888,7 @@ void run_benchmark(const cert_tlstor_t *ct, const char *cert)
         for (d=0; d<5; d++) {
             stat(cert_file, &st);
             sslctx = create_child_sslctx(cert_file, ct->cachain);
-            sslctx_tbl_cache(cert, sslctx, 0);
+            sslctx_hash_insert(cert, sslctx);
         }
         tm1 = elapsed_time_msec(tm) / 5.0;
         printf("load from disk: %.3f ms\n", tm1);

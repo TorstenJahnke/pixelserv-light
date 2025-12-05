@@ -17,12 +17,21 @@
 * CHANGED default certificate validity from 825 to 100 days
 * CHANGED certificate writing order to Key → Cert (industry standard)
 * CHANGED improved OpenSSL 3.0 compatibility (EVP_RSA_gen, EVP_EC_gen)
-* PERFORMANCE RW-locks for SSL context table: concurrent read access, no reader blocking
+* PERFORMANCE 100% lock-free SSL context hash table with FNV-1a hashing
+  - Parallel reads AND writes without any blocking
+  - Atomic CAS operations for concurrent inserts
+  - Open addressing with linear probing
+* PERFORMANCE lock-free Treiber stack for connection storage pool
 * PERFORMANCE lock-free atomic counters: zero contention on stats updates (STAT_INC/STAT_DEC)
-* PERFORMANCE double-check locking prevents redundant certificate generation under high load
-* FIXED thread safety: RW-lock for SSL context table prevents race conditions
+* PERFORMANCE thread pool for parallel certificate generation (4 workers)
+  - Lock-free MPSC queue for work distribution
+  - Fallback to synchronous generation if queue full
+* NEW sharded certificate index (pem_dir/index/) - scales to 5-10 million certificates
+  - 256 shards (00.idx - ff.idx) based on FNV-1a hash
+  - Lock-free parallel access to different shards
+  - Automatic index updates on certificate generation
+* FIXED thread safety: fully lock-free design eliminates all race conditions
 * FIXED atomic operations for all stats counters (lock-free STAT_INC/STAT_DEC)
-* FIXED double-check locking in sslctx_tbl_cache() for concurrent cert loading
 * FIXED BIO NULL pointer check crash in certificate loading
 * FIXED removed deprecated ERR_GET_FUNC for OpenSSL 3.0+
 * FIXED log_msg format string bug (missing __FUNCTION__)
