@@ -13,6 +13,49 @@ AC_CHECK_LIB([crypto], [EVP_EncryptInit], [],
 AC_CHECK_LIB([ssl], [SSL_CTX_new], [],
 	AC_MSG_FAILURE([can't find openssl ssl lib]))
 
+dnl =============================================================================
+dnl Event Loop Backend Detection (io_uring > epoll > kqueue)
+dnl =============================================================================
+
+dnl Check for io_uring (Linux 5.1+, requires liburing)
+AC_MSG_CHECKING([for io_uring support])
+AC_CHECK_LIB([uring], [io_uring_queue_init],
+    [
+        AC_DEFINE([HAVE_IO_URING], [1], [Define if io_uring is available])
+        LIBS="-luring $LIBS"
+        have_io_uring=yes
+        AC_MSG_RESULT([yes])
+    ],
+    [
+        have_io_uring=no
+        AC_MSG_RESULT([no - liburing not found])
+    ])
+
+dnl epoll is always available on Linux (checked at compile time in eventloop.c)
+case "${host_os}" in
+    linux*)
+        have_epoll=yes
+        ;;
+    *)
+        have_epoll=no
+        ;;
+esac
+
+dnl kqueue is available on BSD/macOS (checked at compile time in eventloop.c)
+case "${host_os}" in
+    darwin* | freebsd* | openbsd* | netbsd*)
+        have_kqueue=yes
+        ;;
+    *)
+        have_kqueue=no
+        ;;
+esac
+
+dnl Verify at least one event loop backend is available
+if test "x$have_io_uring" != "xyes" && test "x$have_epoll" != "xyes" && test "x$have_kqueue" != "xyes"; then
+    AC_MSG_ERROR([No event loop backend available! Requires io_uring, epoll (Linux), or kqueue (BSD/macOS)])
+fi
+
 dnl Check for OpenSSL version
 AC_CHECK_DECL([TLS1_3_VERSION],
     [AC_DEFINE([HAVE_TLS1_3], [1], [Define if TLS 1.3 is supported])],
@@ -188,6 +231,12 @@ AC_OUTPUT
 dnl Summary
 AC_MSG_NOTICE([])
 AC_MSG_NOTICE([pixelserv-tls configuration summary:])
+AC_MSG_NOTICE([])
+AC_MSG_NOTICE([  Event loop backends (priority order):])
+AC_MSG_NOTICE([    io_uring (Linux 5.1+): ${have_io_uring:-no}])
+AC_MSG_NOTICE([    epoll (Linux):         ${have_epoll:-no}])
+AC_MSG_NOTICE([    kqueue (BSD/macOS):    ${have_kqueue:-no}])
+AC_MSG_NOTICE([])
 AC_MSG_NOTICE([  TLS 1.3 support:      ${have_tls13:-check header}])
 AC_MSG_NOTICE([  CHACHA20-POLY1305:    ${have_chacha:-check result}])
 AC_MSG_NOTICE([])

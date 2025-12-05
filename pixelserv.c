@@ -23,6 +23,7 @@
 #include <sys/wait.h>
 
 #include "certs.h"
+#include "eventloop.h"
 #include "logger.h"
 #include "socket_handler.h"
 #include "util.h"
@@ -112,11 +113,9 @@ int main (int argc, char* argv[])
   response_struct pipedata = { 0 };
   char* ports[MAX_PORTS + 1]; /* one extra port for admin */
   char *port = NULL;
-  fd_set readfds;
-  fd_set selectfds;
+  evl_loop_t *evloop = NULL;
+  evl_event_t evl_events[MAX_PORTS + 1];  /* +1 for pipe */
   int sockfds[MAX_PORTS];
-  int select_rv = 0;
-  int nfds = 0;
   int num_ports = 0;
   int i;
 #ifdef IF_MODE
@@ -410,8 +409,15 @@ int main (int argc, char* argv[])
     ports[num_ports++] = DEFAULT_PORT;
   }
 
-  // clear the set
-  FD_ZERO(&readfds);
+  // create event loop (io_uring > epoll > kqueue)
+  evloop = evl_create(MAX_PORTS + 1);
+  if (!evloop) {
+    log_msg(LGG_CRIT, "Failed to create event loop");
+    exit(EXIT_FAILURE);
+  }
+  log_msg(LGG_NOTICE, "Event loop backend: %s",
+          evl_backend_name(evl_get_backend(evloop)));
+
   for (i = 0; i < num_ports; i++) {
     port = ports[i];
 
@@ -446,10 +452,10 @@ int main (int argc, char* argv[])
     }
 
     sockfds[i] = sockfd;
-    // add descriptor to the set
-    FD_SET(sockfd, &readfds);
-    if (sockfd > nfds) {
-      nfds = sockfd;
+    // add descriptor to event loop
+    if (evl_add(evloop, sockfd, EVL_READ, (void*)(intptr_t)i) < 0) {
+      log_msg(LGG_CRIT, "evl_add() failed for sockfd");
+      exit(EXIT_FAILURE);
     }
 
     freeaddrinfo(servinfo); // all done with this structure
@@ -532,16 +538,11 @@ int main (int argc, char* argv[])
     exit(EXIT_FAILURE);
   }
 
-  // also have select() monitor the read end of the stats pipe
-  FD_SET(pipefd[0], &readfds);
-  // note if pipe read descriptor is the largest fd number we care about
-  if (pipefd[0] > nfds) {
-    nfds = pipefd[0];
+  // add pipe read end to event loop (use index -1 to identify pipe)
+  if (evl_add(evloop, pipefd[0], EVL_READ, (void*)(intptr_t)-1) < 0) {
+    log_msg(LGG_CRIT, "evl_add() failed for pipefd");
+    exit(EXIT_FAILURE);
   }
-
-  // nfds now contains the largest fd number of interest;
-  //  increment by 1 for use with select()
-  ++nfds;
 
   sin_size = sizeof their_addr;
 
@@ -562,356 +563,326 @@ int main (int argc, char* argv[])
   };
   g = &_g;
 
-  // main accept() loop
+  // main accept() loop using io_uring/epoll/kqueue
+  int num_events;
+  int evt_idx;
   while(1) {
-    // only call select() if we have something more to process
-    if (select_rv <= 0) {
-      // select() modifies its fd set, so make a working copy
-      // readfds should not be referenced after this point, as it must remain
-      //  intact
-      selectfds = readfds;
-      // NOTE: MACRO needs "_GNU_SOURCE"; without this the select gets
-      //       interrupted with errno EINTR
-      select_rv = TEMP_FAILURE_RETRY(select(nfds, &selectfds, NULL, NULL, NULL));
-      if (select_rv < 0) {
-        log_msg(LOG_ERR, "main select() error: %m");
-        exit(EXIT_FAILURE);
-      } else if (select_rv == 0) {
-        // this should be pathological, as we don't specify a timeout
-        log_msg(LGG_WARNING, "main select() returned zero (timeout?)");
-        continue;
-      }
+    // wait for events (blocks until at least one event is ready)
+    num_events = evl_wait(evloop, evl_events, MAX_PORTS + 1, -1);
+    if (num_events < 0) {
+      if (errno == EINTR)
+        continue;  // interrupted by signal, retry
+      log_msg(LOG_ERR, "evl_wait() error: %m");
+      exit(EXIT_FAILURE);
     }
 
-    // find first socket descriptor that is ready to read (if any)
-    // note that even though multiple sockets may be ready, we only process one
-    //  per loop iteration; subsequent ones will be handled on subsequent passes
-    //  through the loop
-    for (i = 0, sockfd = 0; i < num_ports; i++) {
-      if ( FD_ISSET(sockfds[i], &selectfds) ) {
-        // select sockfds[i] for servicing during this loop pass
-        sockfd = sockfds[i];
-        --select_rv;
-        FD_CLR(sockfd, &selectfds);
-        break;
-      }
-    }
+    // process all ready events
+    for (evt_idx = 0; evt_idx < num_events; evt_idx++) {
+      intptr_t idx = (intptr_t)evl_events[evt_idx].data;
 
-    // if select() didn't return due to a socket connection, check for pipe I/O
-    if (!sockfd && FD_ISSET(pipefd[0], &selectfds)) {
-      // perform a single read from pipe
-      rv = read(pipefd[0], &pipedata, sizeof(pipedata));
-      if (rv < 0) {
-        log_msg(LGG_WARNING, "error reading from pipe: %m");
-      } else if (rv == 0) {
-        log_msg(LGG_WARNING, "pipe read() returned zero");
-      } else if (rv != sizeof(pipedata)) {
-        log_msg(LGG_WARNING, "pipe read() got %d bytes, but %u bytes were expected - discarding",
-          rv, (unsigned int)sizeof(pipedata));
-      } else {
-        // process response type (atomic increments for thread safety)
-        switch (pipedata.status) {
-          case FAIL_GENERAL:   STAT_INC(ers); break;
-          case FAIL_TIMEOUT:   STAT_INC(tmo); break;
-          case FAIL_CLOSED:    STAT_INC(cls); break;
-          case FAIL_REPLY:     STAT_INC(cly); break;
-          case SEND_GIF:       STAT_INC(gif); break;
-          case SEND_TXT:       STAT_INC(txt); break;
-          case SEND_JPG:       STAT_INC(jpg); break;
-          case SEND_PNG:       STAT_INC(png); break;
-          case SEND_SWF:       STAT_INC(swf); break;
-          case SEND_ICO:       STAT_INC(ico); break;
-          case SEND_BAD:       STAT_INC(bad); break;
-          case SEND_STATS:     STAT_INC(sta); break;
-          case SEND_STATSTEXT: STAT_INC(stt); break;
-          case SEND_204:       STAT_INC(noc); break;
-          case SEND_REDIRECT:  STAT_INC(rdr); break;
-          case SEND_NO_EXT:    STAT_INC(nfe); break;
-          case SEND_UNK_EXT:   STAT_INC(ufe); break;
-          case SEND_NO_URL:    STAT_INC(nou); break;
-          case SEND_BAD_PATH:  STAT_INC(pth); break;
-          case SEND_POST:      STAT_INC(pst); break;
-          case SEND_HEAD:      STAT_INC(hed); break;
-          case SEND_OPTIONS:   STAT_INC(opt); break;
-          case ACTION_LOG_VERB:  log_set_verb(pipedata.verb); break;
-          case ACTION_DEC_KCC: STAT_DEC(kcc); break;
-          default:
-            log_msg(LOG_DEBUG, "conn_handler reported unknown response value: %d", pipedata.status);
-        }
-        switch (pipedata.ssl) {
-          case SSL_HIT_RTT0:   STAT_INC(zrt); /* fall through */
-          case SSL_HIT:        STAT_INC(slh); break;
-          case SSL_HIT_CLS:    STAT_INC(slc); break;
-          default:             ;
-        }
-        if (pipedata.ssl == SSL_HIT ||
-            pipedata.ssl == SSL_HIT_RTT0 ||
-            pipedata.ssl == SSL_HIT_CLS) {
-          switch (pipedata.ssl_ver) {
-#ifdef TLS1_3_VERSION
-            case TLS1_3_VERSION: STAT_INC(v13); break;
-#endif
-            case TLS1_2_VERSION: STAT_INC(v12); break;
-            case TLS1_VERSION:   STAT_INC(v10); break;
+      // check for pipe event (idx == -1)
+      if (idx == -1) {
+        // drain all available data from pipe
+        while ((rv = read(pipefd[0], &pipedata, sizeof(pipedata))) > 0) {
+          if (rv != sizeof(pipedata)) {
+            log_msg(LGG_WARNING, "pipe read() got %d bytes, but %u bytes were expected - discarding",
+              rv, (unsigned int)sizeof(pipedata));
+            continue;
+          }
+          // process response type (atomic increments for thread safety)
+          switch (pipedata.status) {
+            case FAIL_GENERAL:   STAT_INC(ers); break;
+            case FAIL_TIMEOUT:   STAT_INC(tmo); break;
+            case FAIL_CLOSED:    STAT_INC(cls); break;
+            case FAIL_REPLY:     STAT_INC(cly); break;
+            case SEND_GIF:       STAT_INC(gif); break;
+            case SEND_TXT:       STAT_INC(txt); break;
+            case SEND_JPG:       STAT_INC(jpg); break;
+            case SEND_PNG:       STAT_INC(png); break;
+            case SEND_SWF:       STAT_INC(swf); break;
+            case SEND_ICO:       STAT_INC(ico); break;
+            case SEND_BAD:       STAT_INC(bad); break;
+            case SEND_STATS:     STAT_INC(sta); break;
+            case SEND_STATSTEXT: STAT_INC(stt); break;
+            case SEND_204:       STAT_INC(noc); break;
+            case SEND_REDIRECT:  STAT_INC(rdr); break;
+            case SEND_NO_EXT:    STAT_INC(nfe); break;
+            case SEND_UNK_EXT:   STAT_INC(ufe); break;
+            case SEND_NO_URL:    STAT_INC(nou); break;
+            case SEND_BAD_PATH:  STAT_INC(pth); break;
+            case SEND_POST:      STAT_INC(pst); break;
+            case SEND_HEAD:      STAT_INC(hed); break;
+            case SEND_OPTIONS:   STAT_INC(opt); break;
+            case ACTION_LOG_VERB:  log_set_verb(pipedata.verb); break;
+            case ACTION_DEC_KCC: STAT_DEC(kcc); break;
+            default:
+              log_msg(LOG_DEBUG, "conn_handler reported unknown response value: %d", pipedata.status);
+          }
+          switch (pipedata.ssl) {
+            case SSL_HIT_RTT0:   STAT_INC(zrt); /* fall through */
+            case SSL_HIT:        STAT_INC(slh); break;
+            case SSL_HIT_CLS:    STAT_INC(slc); break;
             default:             ;
           }
-        }
-        if (pipedata.status < ACTION_LOG_VERB) {
-          STAT_INC(count);
-          // count only positive receive sizes
-          if (pipedata.rx_total <= 0) {
-            log_msg(LOG_DEBUG, "pipe read() got nonsensical rx_total data value %d - ignoring", pipedata.rx_total);
-          } else {
-            // calculate average byte per request (avg) using
-            static float favg = 0.0; 
-            static int favg_cnt = 0;
-            favg = ema(favg, pipedata.rx_total, &favg_cnt);
-            avg = favg + 0.5;
-            // look for a new high score
-            if (pipedata.rx_total > rmx)
-              rmx = pipedata.rx_total;
+          if (pipedata.ssl == SSL_HIT ||
+              pipedata.ssl == SSL_HIT_RTT0 ||
+              pipedata.ssl == SSL_HIT_CLS) {
+            switch (pipedata.ssl_ver) {
+#ifdef TLS1_3_VERSION
+              case TLS1_3_VERSION: STAT_INC(v13); break;
+#endif
+              case TLS1_2_VERSION: STAT_INC(v12); break;
+              case TLS1_VERSION:   STAT_INC(v10); break;
+              default:             ;
+            }
           }
+          if (pipedata.status < ACTION_LOG_VERB) {
+            STAT_INC(count);
+            // count only positive receive sizes
+            if (pipedata.rx_total <= 0) {
+              log_msg(LOG_DEBUG, "pipe read() got nonsensical rx_total data value %d - ignoring", pipedata.rx_total);
+            } else {
+              // calculate average byte per request (avg) using
+              static float favg = 0.0;
+              static int favg_cnt = 0;
+              favg = ema(favg, pipedata.rx_total, &favg_cnt);
+              avg = favg + 0.5;
+              // look for a new high score
+              if (pipedata.rx_total > rmx)
+                rmx = pipedata.rx_total;
+            }
 
-          if (pipedata.status != FAIL_TIMEOUT && pipedata.rx_total > 0) {
-            // calculate average process time (tav) using
-            static float ftav = 0.0;
-            static int ftav_cnt = 0;
-            ftav = ema(ftav, pipedata.run_time, &ftav_cnt);
-            tav = ftav + 0.5;
-            // look for a new high score, adding 0.5 for rounding
-            if (pipedata.run_time + 0.5 > tmx)
-              tmx = (pipedata.run_time + 0.5);
+            if (pipedata.status != FAIL_TIMEOUT && pipedata.rx_total > 0) {
+              // calculate average process time (tav) using
+              static float ftav = 0.0;
+              static int ftav_cnt = 0;
+              ftav = ema(ftav, pipedata.run_time, &ftav_cnt);
+              tav = ftav + 0.5;
+              // look for a new high score, adding 0.5 for rounding
+              if (pipedata.run_time + 0.5 > tmx)
+                tmx = (pipedata.run_time + 0.5);
+            }
+          } else if (pipedata.status == ACTION_DEC_KCC) {
+            static int kvg_cnt = 0;
+            kvg = ema(kvg, pipedata.krq, &kvg_cnt);
+            if (pipedata.krq > STAT_LOAD(krq))
+              STAT_STORE(krq, pipedata.krq);
           }
-        } else if (pipedata.status == ACTION_DEC_KCC) {
-          static int kvg_cnt = 0;
-          kvg = ema(kvg, pipedata.krq, &kvg_cnt);
-          if (pipedata.krq > STAT_LOAD(krq))
-            STAT_STORE(krq, pipedata.krq);
         }
+        if (rv < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+          log_msg(LGG_WARNING, "error reading from pipe: %m");
+        }
+        continue;  // next event
       }
-      --select_rv;
-      continue;
-    }
 
-    // if select() returned but no fd's of interest were found, give up
-    // note that this is bad because it means that select() will probably never
-    //  block again because something will always be waiting on the unhandled
-    //  file descriptor
-    // on the other hand, this should be a pathological case unless something is
-    //  added to FD_SET that is not checked before this point
-    if (!sockfd) {
-      log_msg(LGG_WARNING, "select() returned a value of %d but no file descriptors of interest are ready for read", select_rv);
-      // force select_rv to zero so that select() will be called on the next
-      //  loop iteration
-      select_rv = 0;
-      continue;
-    }
+      // socket event: accept new connection
+      sockfd = sockfds[idx];
+      struct timespec init_time = {0, 0};
+      get_time(&init_time);
+      new_fd = accept(sockfd, (struct sockaddr *) &their_addr, &sin_size);
+      if (new_fd < 0) {
+          if (errno == EAGAIN || errno == EWOULDBLOCK) {
+              STAT_INC(cls);   /* client closed connection before we got a chance to accept it */
+          }
+          log_msg(LGG_DEBUG, "accept: %m");
+          continue;
+      }
+      if (STAT_LOAD(kcc) >= max_num_threads) {
+          STAT_INC(clt);
+          shutdown(new_fd, SHUT_RDWR);
+          close(new_fd);
+          continue;
+      }
 
-    struct timespec init_time = {0, 0};
-    get_time(&init_time);
-    new_fd = accept(sockfd, (struct sockaddr *) &their_addr, &sin_size);
-    if (new_fd < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            STAT_INC(cls);   /* client closed connection before we got a chance to accept it */
-        }
-        log_msg(LGG_DEBUG, "accept: %m");
+      conn_tlstor_struct *conn_tlstor = conn_stor_acquire();
+      if (conn_tlstor == NULL) {
+        log_msg(LGG_WARNING, "%s conn_tlstor alloc failed ", __FUNCTION__);
         continue;
-    }
-    if (STAT_LOAD(kcc) >= max_num_threads) {
-        STAT_INC(clt);
-        shutdown(new_fd, SHUT_RDWR);
-        close(new_fd);
-        continue;
-    }
+      }
 
-    conn_tlstor_struct *conn_tlstor = conn_stor_acquire();
-    if (conn_tlstor == NULL) {
-      log_msg(LGG_WARNING, "%s conn_tlstor alloc failed ", __FUNCTION__);
-      continue;
-    }
+      /* Set fd to blocking explicitly.
+         On Linux, fd attributes are not inherited from parent.
+         On macOS, the attributes are inherited from parent. */
+      int flags;
+      if ((flags = fcntl(new_fd, F_GETFL, 0)) < 0 || fcntl(new_fd, F_SETFL, flags & (~O_NONBLOCK)) < 0)
+          log_msg(LGG_WARNING, "%s fail to set new_fd to blocking", __FUNCTION__);
 
-    /* Set fd to blocking explicitly.
-       On Linux, fd attributes are not inherited from parent.
-       On macOS, the attributes are inherited from parent. */
-    int flags;
-    if ((flags = fcntl(new_fd, F_GETFL, 0)) < 0 || fcntl(new_fd, F_SETFL, flags & (~O_NONBLOCK)) < 0)
-        log_msg(LGG_WARNING, "%s fail to set new_fd to blocking", __FUNCTION__);
+      /* Set socket to TCP_NODELAY explicitly.
+         On Linux, socket options are inherited from parent.
+         On macOS, the attributes are not inherited from parent. */
+      if (setsockopt(new_fd, IPPROTO_TCP, TCP_NODELAY, &(int){ 1 }, sizeof(int)) ||
+          setsockopt(new_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&(struct timeval){ 0, 150000 },
+              sizeof(struct timeval)))  {
+          log_msg(LGG_WARNING, "%s setsockopt() failed on new_fd", __FUNCTION__);
+      }
 
-    /* Set socket to TCP_NODELAY explicitly.
-       On Linux, socket options are inherited from parent.
-       On macOS, the attributes are not inherited from parent. */
-    if (setsockopt(new_fd, IPPROTO_TCP, TCP_NODELAY, &(int){ 1 }, sizeof(int)) ||
-        setsockopt(new_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&(struct timeval){ 0, 150000 },
-            sizeof(struct timeval)))  {
-        log_msg(LGG_WARNING, "%s setsockopt() failed on new_fd", __FUNCTION__);
-    }
+      conn_tlstor->new_fd = new_fd;
+      conn_tlstor->ssl = NULL;
+      conn_tlstor->allow_admin = (!admin_port) ? 1 : 0;
+      char *server_ip = conn_tlstor->tlsext_cb_arg->servername;
+      int ssl_port = is_ssl_conn(new_fd, server_ip, INET6_ADDRSTRLEN, tls_ports, num_tls_ports);
+      if (ssl_port) {
+        int ssl_attempt = 5;
+        int sslerr = SSL_ERROR_NONE;
+        char ip_buf[NI_MAXHOST], port_buf[NI_MAXSERV];
 
-    conn_tlstor->new_fd = new_fd;
-    conn_tlstor->ssl = NULL;
-    conn_tlstor->allow_admin = (!admin_port) ? 1 : 0;
-    char *server_ip = conn_tlstor->tlsext_cb_arg->servername;
-    int ssl_port = is_ssl_conn(new_fd, server_ip, INET6_ADDRSTRLEN, tls_ports, num_tls_ports);
-    if (ssl_port) {
-      int ssl_attempt = 5;
-      int sslerr = SSL_ERROR_NONE;
-      char ip_buf[NI_MAXHOST], port_buf[NI_MAXSERV];
+        tlsext_cb_arg_struct *t = conn_tlstor->tlsext_cb_arg;
+        SSL *ssl = NULL;
+        t->tls_pem = tls_pem;
+        t->cachain = cert_tlstor.cachain;
+        t->status = SSL_UNKNOWN;
+        t->sslctx_idx = -1;
 
-      tlsext_cb_arg_struct *t = conn_tlstor->tlsext_cb_arg;
-      SSL *ssl = NULL;
-      t->tls_pem = tls_pem;
-      t->cachain = cert_tlstor.cachain;
-      t->status = SSL_UNKNOWN;
-      t->sslctx_idx = -1;
-
-      ssl = SSL_new(sslctx);
-      SSL_set_fd(ssl, new_fd);
-      conn_tlstor->ssl = ssl;
-      if (ssl_port == admin_port)
-        conn_tlstor->allow_admin = 1;
+        ssl = SSL_new(sslctx);
+        SSL_set_fd(ssl, new_fd);
+        conn_tlstor->ssl = ssl;
+        if (ssl_port == admin_port)
+          conn_tlstor->allow_admin = 1;
 
 #ifdef TLS1_3_VERSION
-      SSL_CTX_set_client_hello_cb(sslctx, tls_clienthello_cb, t);
-      conn_tlstor->early_data = read_tls_early_data(ssl, &sslerr);
-      if (conn_tlstor->early_data) {
-        conn_tlstor->init_time = elapsed_time_msec(init_time);
-        goto start_service_thread;
-      }
+        SSL_CTX_set_client_hello_cb(sslctx, tls_clienthello_cb, t);
+        conn_tlstor->early_data = read_tls_early_data(ssl, &sslerr);
+        if (conn_tlstor->early_data) {
+          conn_tlstor->init_time = elapsed_time_msec(init_time);
+          goto start_service_thread;
+        }
 
-      /* handle TLS error if any and skip further TLS handshake */
-      if (sslerr != SSL_ERROR_NONE)
-        goto skip_ssl_accept;
+        /* handle TLS error if any and skip further TLS handshake */
+        if (sslerr != SSL_ERROR_NONE)
+          goto skip_ssl_accept;
 #else
-      SSL_CTX_set_tlsext_servername_arg(sslctx, t);
-      conn_tlstor->early_data = NULL;
+        SSL_CTX_set_tlsext_servername_arg(sslctx, t);
+        conn_tlstor->early_data = NULL;
 #endif
-      conn_tlstor->init_time = elapsed_time_msec(init_time);
+        conn_tlstor->init_time = elapsed_time_msec(init_time);
 
-      /* proceed or continue with TLS handshake */
+        /* proceed or continue with TLS handshake */
 
 redo_ssl_accept:
 
-      errno = 0;
-      ERR_clear_error();
-      int sslret = SSL_accept(ssl);
-      if (sslret == 1)
-        goto start_service_thread;
-      sslerr = SSL_get_error(ssl, sslret);
+        errno = 0;
+        ERR_clear_error();
+        int sslret = SSL_accept(ssl);
+        if (sslret == 1)
+          goto start_service_thread;
+        sslerr = SSL_get_error(ssl, sslret);
 
 #ifdef TLS1_3_VERSION
 
 skip_ssl_accept:
 
 #endif
-      if (log_get_verb() >= LGG_WARNING && getnameinfo((struct sockaddr *)&their_addr, sin_size,
-            ip_buf, sizeof ip_buf, port_buf, sizeof port_buf, NI_NUMERICHOST | NI_NUMERICSERV ) != 0) {
-        ip_buf[0] = '\0';
-        port_buf[0] = '\0';
-        log_msg(LOG_ERR, "failed to get client_ip: %s", strerror(errno));
-      }
+        if (log_get_verb() >= LGG_WARNING && getnameinfo((struct sockaddr *)&their_addr, sin_size,
+              ip_buf, sizeof ip_buf, port_buf, sizeof port_buf, NI_NUMERICHOST | NI_NUMERICSERV ) != 0) {
+          ip_buf[0] = '\0';
+          port_buf[0] = '\0';
+          log_msg(LOG_ERR, "failed to get client_ip: %s", strerror(errno));
+        }
 
-      switch(sslerr) {
-        case SSL_ERROR_WANT_READ:
-          ssl_attempt--;
-          if (ssl_attempt > 0) {
-            get_time(&init_time);
-            goto redo_ssl_accept;
-          }
-          log_msg(LGG_WARNING, "handshake failed: reached max retries. client %s:%s server %s",
-              ip_buf, port_buf, t->servername);
-          break;
-        case SSL_ERROR_SSL:
-          switch(ERR_GET_REASON(ERR_peek_last_error())) {
-              case SSL_R_SSLV3_ALERT_BAD_CERTIFICATE:
-                  STAT_INC(ucb);
-                  log_msg(LGG_WARNING, "handshake failed: bad cert. client %s:%s server %s",
-                      ip_buf, port_buf, t->servername);
-                  break;
-              case SSL_R_TLSV1_ALERT_UNKNOWN_CA:
-                  STAT_INC(uca);
-                  log_msg(LGG_WARNING, "handshake failed: unknown CA. client %s:%s server %s",
-                      ip_buf, port_buf, t->servername);
-                  break;
-              case SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN:
-                  STAT_INC(uce);
-                  log_msg(LGG_WARNING, "handshake failed: unknown cert. client %s:%s server %s",
-                      ip_buf, port_buf, t->servername);
-                  break;
-              case SSL_R_PARSE_TLSEXT:
-                  if (t->status == SSL_MISS)
-                    break;
-                  /* fall through */
-              default:
-                  log_msg(LGG_WARNING, "handshake failed: client %s:%s server %s. Lib(%d) Reason(%d)",
-                      ip_buf, port_buf, t->servername,
-                          ERR_GET_LIB(ERR_peek_last_error()),
-                              ERR_GET_REASON(ERR_peek_last_error()));
-          }
-          break;
-        case SSL_ERROR_SYSCALL:
-             /* OpenSSL 1.1.x clienthello will reach here
-                but we want to skip if it's known error such as missing certs */
-            if (t->status == SSL_MISS)
-              break;
-
-            if (errno == 0 || errno == 104) {
-              char m[2];
-              int rv = recv(new_fd, m, 2, MSG_PEEK);
-              if (rv == 0) {
-                STAT_INC(ush);
-                log_msg(LGG_WARNING, "handshake failed: shutdown after ServerHello. client %s:%s server %s",
-                  ip_buf, port_buf, t->servername);
-                break;
-              }
+        switch(sslerr) {
+          case SSL_ERROR_WANT_READ:
+            ssl_attempt--;
+            if (ssl_attempt > 0) {
+              get_time(&init_time);
+              goto redo_ssl_accept;
             }
-            log_msg(LGG_WARNING, "handshake failed: socket I/O error. client %s:%s server %s. errno: %d",
-                ip_buf, port_buf, t->servername, errno);
-        default:
-          ;
+            log_msg(LGG_WARNING, "handshake failed: reached max retries. client %s:%s server %s",
+                ip_buf, port_buf, t->servername);
+            break;
+          case SSL_ERROR_SSL:
+            switch(ERR_GET_REASON(ERR_peek_last_error())) {
+                case SSL_R_SSLV3_ALERT_BAD_CERTIFICATE:
+                    STAT_INC(ucb);
+                    log_msg(LGG_WARNING, "handshake failed: bad cert. client %s:%s server %s",
+                        ip_buf, port_buf, t->servername);
+                    break;
+                case SSL_R_TLSV1_ALERT_UNKNOWN_CA:
+                    STAT_INC(uca);
+                    log_msg(LGG_WARNING, "handshake failed: unknown CA. client %s:%s server %s",
+                        ip_buf, port_buf, t->servername);
+                    break;
+                case SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN:
+                    STAT_INC(uce);
+                    log_msg(LGG_WARNING, "handshake failed: unknown cert. client %s:%s server %s",
+                        ip_buf, port_buf, t->servername);
+                    break;
+                case SSL_R_PARSE_TLSEXT:
+                    if (t->status == SSL_MISS)
+                      break;
+                    /* fall through */
+                default:
+                    log_msg(LGG_WARNING, "handshake failed: client %s:%s server %s. Lib(%d) Reason(%d)",
+                        ip_buf, port_buf, t->servername,
+                            ERR_GET_LIB(ERR_peek_last_error()),
+                                ERR_GET_REASON(ERR_peek_last_error()));
+            }
+            break;
+          case SSL_ERROR_SYSCALL:
+               /* OpenSSL 1.1.x clienthello will reach here
+                  but we want to skip if it's known error such as missing certs */
+              if (t->status == SSL_MISS)
+                break;
+
+              if (errno == 0 || errno == 104) {
+                char m[2];
+                int rv = recv(new_fd, m, 2, MSG_PEEK);
+                if (rv == 0) {
+                  STAT_INC(ush);
+                  log_msg(LGG_WARNING, "handshake failed: shutdown after ServerHello. client %s:%s server %s",
+                    ip_buf, port_buf, t->servername);
+                  break;
+                }
+              }
+              log_msg(LGG_WARNING, "handshake failed: socket I/O error. client %s:%s server %s. errno: %d",
+                  ip_buf, port_buf, t->servername, errno);
+          default:
+            ;
+        }
+        STAT_INC(count);
+        switch(t->status) {
+          case SSL_ERR:        STAT_INC(sle); break;
+          case SSL_MISS:       STAT_INC(slm); break;
+          case SSL_HIT:
+          case SSL_UNKNOWN:    STAT_INC(slu); break;
+          default:             ;
+        }
+        SSL_set_shutdown(ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
+        SSL_free(ssl);
+        shutdown(new_fd, SHUT_RDWR);
+        close(new_fd);
+        conn_stor_relinq(conn_tlstor);
+        continue;
       }
-      STAT_INC(count);
-      switch(t->status) {
-        case SSL_ERR:        STAT_INC(sle); break;
-        case SSL_MISS:       STAT_INC(slm); break;
-        case SSL_HIT:
-        case SSL_UNKNOWN:    STAT_INC(slu); break;
-        default:             ;
-      }
-      SSL_set_shutdown(ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
-      SSL_free(ssl);
-      shutdown(new_fd, SHUT_RDWR);
-      close(new_fd);
-      conn_stor_relinq(conn_tlstor);
-      continue;
-    }
 
 start_service_thread:
 
-    conn_tlstor->init_time += elapsed_time_msec(init_time);
-    pthread_t conn_thread;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_attr_setstacksize(&attr, THREAD_STACK_SIZE);
-    int err;
-    if ((err=pthread_create(&conn_thread, &attr, conn_handler, (void*)conn_tlstor))) {
-      log_msg(LGG_ERR, "Failed to create conn_handler thread. err: %d", err);
-      if(conn_tlstor->ssl){
-        SSL_set_shutdown(conn_tlstor->ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
-        SSL_free(conn_tlstor->ssl);
+      conn_tlstor->init_time += elapsed_time_msec(init_time);
+      pthread_t conn_thread;
+      pthread_attr_t attr;
+      pthread_attr_init(&attr);
+      pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+      pthread_attr_setstacksize(&attr, THREAD_STACK_SIZE);
+      int err;
+      if ((err=pthread_create(&conn_thread, &attr, conn_handler, (void*)conn_tlstor))) {
+        log_msg(LGG_ERR, "Failed to create conn_handler thread. err: %d", err);
+        if(conn_tlstor->ssl){
+          SSL_set_shutdown(conn_tlstor->ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
+          SSL_free(conn_tlstor->ssl);
+        }
+        shutdown(new_fd, SHUT_RDWR);
+        close(new_fd);
+        conn_stor_relinq(conn_tlstor);
+        continue;
       }
-      shutdown(new_fd, SHUT_RDWR);
-      close(new_fd);
-      conn_stor_relinq(conn_tlstor);
-      continue;
-    }
-    pthread_attr_destroy(&attr);
+      pthread_attr_destroy(&attr);
 
-    {
-      sig_atomic_t new_kcc = STAT_INC(kcc) + 1;  /* STAT_INC returns old value */
-      if (new_kcc > STAT_LOAD(kmx))
-        STAT_STORE(kmx, new_kcc);
-    }
-  } // end of perpetual accept() loop
+      {
+        sig_atomic_t new_kcc = STAT_INC(kcc) + 1;  /* STAT_INC returns old value */
+        if (new_kcc > STAT_LOAD(kmx))
+          STAT_STORE(kmx, new_kcc);
+      }
+    } // end of event processing loop
+  } // end of main event loop (io_uring/epoll/kqueue)
 
   pthread_cancel(certgen_thread);
   pthread_join(certgen_thread, NULL);
