@@ -309,6 +309,7 @@ int main (int argc, char* argv[])
 
   if (error) {
     printf("pixelserv-tls %s (compiled: " __DATE__ " " __TIME__ FEATURE_FLAGS ")\n"
+           "SSL Library: %s\n"
            "Usage: pixelserv-tls [OPTION]" "\n"
            "options:" "\n"
            "\t" "ip_addr/hostname\t(default: 0.0.0.0)" "\n"
@@ -350,7 +351,8 @@ int main (int argc, char* argv[])
            "\t" "-z  CERT_PATH\t\t(default: "
            DEFAULT_PEM_PATH
            ")" "\n"
-           , VERSION, DEFAULT_CERT_CACHE_SIZE, DEFAULT_CERT_VALIDITY_DAYS, DEFAULT_KEEPALIVE,
+           , VERSION, OpenSSL_version(OPENSSL_VERSION),
+           DEFAULT_CERT_CACHE_SIZE, DEFAULT_CERT_VALIDITY_DAYS, DEFAULT_KEEPALIVE,
            DEFAULT_THREAD_MAX);
     exit(EXIT_FAILURE);
   }
