@@ -15,6 +15,7 @@
 /* io_uring (Linux 5.1+) */
 #if defined(__linux__) && defined(HAVE_IO_URING)
 #  include <liburing.h>
+#  include <poll.h>  /* POLLIN, POLLOUT, etc. */
 #  define EVL_HAS_IO_URING 1
 #else
 #  define EVL_HAS_IO_URING 0
@@ -162,7 +163,7 @@ static int evl_mod_io_uring(evl_loop_t *loop, int fd, uint32_t events, void *dat
     struct io_uring_sqe *sqe = io_uring_get_sqe(&loop->u.uring.ring);
     if (!sqe) return -1;
 
-    io_uring_prep_poll_remove(sqe, (void*)(intptr_t)fd);
+    io_uring_prep_poll_remove(sqe, (__u64)(uintptr_t)fd);
     io_uring_submit(&loop->u.uring.ring);
 
     return evl_add_io_uring(loop, fd, events, data);
@@ -172,7 +173,7 @@ static int evl_del_io_uring(evl_loop_t *loop, int fd) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&loop->u.uring.ring);
     if (!sqe) return -1;
 
-    io_uring_prep_poll_remove(sqe, (void*)(intptr_t)fd);
+    io_uring_prep_poll_remove(sqe, (__u64)(uintptr_t)fd);
     return io_uring_submit(&loop->u.uring.ring) >= 0 ? 0 : -1;
 }
 
