@@ -1,0 +1,89 @@
+# tlsgateNG
+# ├── backup
+# ├── bundles
+# ├── poolgen
+# │   ├── aviontex
+# │   │   ├── ECDSA
+# │   │   │   └── rootCA
+# │   │   │       ├── rootca.crt
+# │   │   │       ├── subca.crt
+# │   │   │       └── subca.key
+# │   │   ├── RSA
+# │   │   │   ├── certs
+# │   │   │   ├── index
+# │   │   │   │   └── shm_certcache.bin
+# │   │   │   └── rootCA
+# │   │   │       ├── rootca.crt
+# │   │   │       ├── subca.crt
+# │   │   │       └── subca.key
+# │   │   └── SM2
+# │   │       └── rootCA
+# │   │           ├── rootca.crt
+# │   │           ├── subca.crt
+# │   │           └── subca.key
+# │   └── poolgen.conf
+# ├── primes
+# │   ├── 3072.txt
+# │   ├── prime-3072-p.bin >> (prime-ALGO-p.bin)
+# │   └── prime-3072-q.bin >> (prime-ALGO-q.bin)
+# ├── second-level-tlds.conf
+# ├── silent-blocks.conf
+# └── tlsgateNG.conf
+
+[version]
+4.36.0.1
+
+[prime]
+path=/etc/tlsgateNG/primes
+
+[keypool]
+path=/etc/tlsgateNG/bundles
+
+[backup]
+enable=true
+path=/etc/tlsgateNG/backup
+master=true
+
+[server]
+workers=8
+
+[runtime]
+daemonize=false
+verbose=false
+
+[certificate]
+second-level-tld-file=/etc/tlsgateNG/second-level-tlds.conf
+silent-block-file=/etc/tlsgateNG/silent-blocks.conf
+
+[pool]
+use-shm=true
+poolkeygen-mode=true
+pool-size=1000000
+certcache-capacity=20M
+rsa-3072-percent=20
+ecdsa-p256-percent=40
+sm2-percent=40
+
+[index]
+master=true
+
+[directories]
+ca-dir=/etc/tlsgateNG/poolgen/aviontex
+
+[ca-RSA]
+sub-cert-path=/etc/tlsgateNG/poolgen/aviontex/RSA/rootCA/subca.crt
+sub-key-path=/etc/tlsgateNG/poolgen/aviontex/RSA/rootCA/subca.key
+root-cert-path=/etc/tlsgateNG/poolgen/aviontex/RSA/rootCA/rootca.crt
+
+[ca-ECDSA]
+sub-cert-path=/etc/tlsgateNG/poolgen/aviontex/ECDSA/rootCA/subca.crt
+sub-key-path=/etc/tlsgateNG/poolgen/aviontex/ECDSA/rootCA/subca.key
+root-cert-path=/etc/tlsgateNG/poolgen/aviontex/ECDSA/rootCA/rootca.crt
+
+[ca-SM2]
+sub-cert-path=/etc/tlsgateNG/poolgen/aviontex/SM2/rootCA/subca.crt
+sub-key-path=/etc/tlsgateNG/poolgen/aviontex/SM2/rootCA/subca.key
+root-cert-path=/etc/tlsgateNG/poolgen/aviontex/SM2/rootCA/rootca.crt
+
+[license]
+#key=XXXX-XXXX-XXXX-XXXX

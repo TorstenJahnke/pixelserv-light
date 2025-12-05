@@ -1,0 +1,46 @@
+==========================================
+TLSGateNX - CA Statistik
+==========================================
+Last Backup from: 2025-11-10 09:24:13
+
+==========================================
+CA Zertifikate
+==========================================
+
+CA Typ: Single-Tier
+Anzahl Zertifikate: 1
+
+--- CA ---
+Datei: ca.crt
+Pfad: /home/user/TLSGateNXv3/rootCA/ca.crt
+
+Subject:
+  C = DE, ST = NRW, L = Dortmund, O = TLSGateNX, OU = Test, CN = TLSGateNX Test CA
+Issuer:
+  C = DE, ST = NRW, L = Dortmund, O = TLSGateNX, OU = Test, CN = TLSGateNX Test CA
+Validity:
+  notBefore=Nov 10 09:23:00 2025 GMT
+  notAfter=Nov  8 09:23:00 2035 GMT
+Serial:
+  2207810AD19F8661E6F8BB7A86F934A9363492B1
+
+==========================================
+Private Keys
+==========================================
+
+Anzahl Keys: 1
+
+Gefundene Keys:
+  - ca.key
+    Pfad: /home/user/TLSGateNXv3/rootCA/ca.key
+    Status: Unverschlüsselt
+    Typ: Private-Key: (2048 bit, 2 primes)
+
+==========================================
+Zusätzliche Dateien
+==========================================
+
+
+==========================================
+Ende der Statistik
+==========================================

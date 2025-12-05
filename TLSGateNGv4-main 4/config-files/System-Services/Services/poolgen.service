@@ -1,0 +1,57 @@
+[Unit]
+Description=TLSGate NG v4.36 GEN4 - Keypool Generator PRIMARY (HA Active)
+Documentation=https://github.com/TorstenJahnke/TLSGateNGv4
+After=network.target network-online.target
+Wants=network-online.target
+PartOf=tlsgateNG.target
+
+# HA Configuration:
+# This is the PRIMARY poolgen instance.
+# - Tries to acquire leadership immediately on start
+# - If successful: runs keypool, watchdog, maintenance
+# - If another instance holds the lock: waits until it becomes available
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/etc/tlsgateNG/poolgen
+
+# Binary path - Keypool generator (PRIMARY)
+# Config: /etc/tlsgateNG/poolgen/poolgen.conf (copy from examples/)
+ExecStart=/usr/local/etc/tlsgateNG/tlsgateNG-poolgen \
+    --poolkeygen \
+    --shm \
+    --ha-role=primary \
+    -c /etc/tlsgateNG/poolgen/poolgen.conf
+
+# Process management
+Restart=always
+RestartSec=10s
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+# Performance tuning
+LimitNOFILE=65536
+LimitNPROC=512
+Nice=-10
+
+# Security hardening (relaxed for shared memory access)
+PrivateTmp=no
+PrivateIPC=no
+NoNewPrivileges=no
+ProtectSystem=off
+ProtectHome=no
+
+# Capabilities (needed for shared memory and lock file)
+AmbientCapabilities=CAP_IPC_LOCK CAP_SYS_RESOURCE
+CapabilityBoundingSet=CAP_IPC_LOCK CAP_SYS_RESOURCE CAP_SETUID CAP_SETGID
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=poolgen
+
+[Install]
+WantedBy=multi-user.target

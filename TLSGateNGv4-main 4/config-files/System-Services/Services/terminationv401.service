@@ -1,0 +1,64 @@
+# =============================================================================
+# TLSGate NG - Aviontex Termination Worker 01 (IPv4)
+# =============================================================================
+# Startreihenfolge:
+#   1. poolgen.service
+#   2. terminationv401.service  ← DIESER SERVICE
+#
+# WICHTIG: Startet ERST wenn Poolgen läuft!
+#
+# Installation:
+#   cp terminationv401.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable terminationv401.service
+#
+# =============================================================================
+
+[Unit]
+Description=TLSGate NG v4.36 - Aviontex Termination Worker 01 (IPv4)
+Documentation=https://github.com/TorstenJahnke/TLSGateNGv4
+
+# Netzwerk muss verfügbar sein
+After=network.target network-online.target
+Wants=network-online.target
+
+# WICHTIG: Wartet auf Poolgen!
+After=poolgen.service
+Requires=poolgen.service
+
+[Service]
+Type=simple
+
+# Startet als root - Binary macht DropRoot intern!
+# (NoNewPrivileges/ProtectSystem würden DropRoot verhindern)
+
+# Arbeitsverzeichnis
+WorkingDirectory=/etc/tlsgateNG/aviontex/termination
+
+# 90 Sekunden warten bis Poolgen SHM vollständig initialisiert hat
+#ExecStartPre=/bin/sleep 90
+
+# Termination Worker mit SHM-Keypool
+ExecStart=/usr/local/etc/tlsgateNG/termination/tlsgateNGv401 \
+    --shm \
+    -c /etc/tlsgateNG/aviontex/termination/termination.v4.31.conf
+
+# Restart bei Crash
+Restart=always
+RestartSec=3s
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+# Performance für High-Traffic
+LimitNOFILE=1048576
+LimitNPROC=4096
+Nice=-5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=terminationv401
+
+[Install]
+WantedBy=multi-user.target

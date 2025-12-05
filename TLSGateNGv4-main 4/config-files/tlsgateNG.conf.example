@@ -1,0 +1,290 @@
+# =============================================================================
+# TLSGate NG - Server Configuration (IPv4/IPv6 Worker)
+# =============================================================================
+# Optimiert für: tlsgateNGv4 / tlsgateNGv6 (Server-Instanzen)
+#
+# Aufgaben des Servers:
+#   1. TLS/SSL Terminierung und Zertifikat-Generierung
+#   2. Empfängt Schlüssel vom Poolgen via Shared Memory
+#   3. Verarbeitet HTTP/HTTPS Anfragen
+#   4. Registriert sich beim Poolgen-Watchdog (automatischer Restart bei Crash)
+#
+# Architektur:
+#   [tlsgateNG-poolgen] ─┬─(SHM Keypool)──► [tlsgateNGv4] ──► HAProxy/Client
+#                        │                  [tlsgateNGv6] ──► HAProxy/Client
+#                        │
+#                        └─(Watchdog)───────► Überwacht Server, startet bei Crash
+#
+# Installation:
+#   cp config-files/tlsgateNG.conf.example /etc/tlsgateNG/tlsgateNG.conf
+#   systemctl start tlsgateNGv4
+#
+# =============================================================================
+
+[version]
+# WICHTIG: Muss EXAKT mit Binary-Version übereinstimmen!
+4.36.0.1
+
+# =============================================================================
+# WATCHDOG INTEGRATION
+# =============================================================================
+# Der Server registriert sich automatisch beim Poolgen-Watchdog:
+#
+#   - Bei Start: Registrierung mit PID und Kommandozeile
+#   - Laufzeit: Heartbeat alle 30 Sekunden
+#   - Bei Crash: Poolgen startet Server automatisch neu
+#   - Bei Shutdown: Saubere Abmeldung (kein Restart)
+#
+# Voraussetzung: Poolgen muss laufen (poolkeygen_mode=true, use_shm=true)
+# Keine Konfiguration nötig - funktioniert automatisch!
+
+# =============================================================================
+# PRIME POOL (Sophie-Germain Primzahlen für RSA)
+# =============================================================================
+[prime]
+path=/etc/tlsgateNG/primes
+
+# =============================================================================
+# KEYPOOL (Generierte Schlüssel)
+# =============================================================================
+[keypool]
+path=/etc/tlsgateNG/bundles
+
+# =============================================================================
+# BACKUP (Automatische Sicherung)
+# =============================================================================
+[backup]
+# Automatisches Backup von Zertifikaten und Index
+enable=true
+
+# Master-Modus für Backup
+# NUR EINE Instanz sollte Backups durchführen!
+#   - IPv4-Server: master=true  (empfohlen)
+#   - IPv6-Server: master=false
+master=true
+
+# Backup-Verzeichnis
+path=/etc/tlsgateNG/backup
+
+# AES-256-GCM Verschlüsselung (DSGVO, PCI-DSS)
+encrypt=true
+
+# CA Private Key für Verschlüsselung
+ca_key=/opt/TLSGateNX/rootCA/RSA/subca.key
+
+# Key-Derivation Kurve (LLPPXX Format)
+# WICHTIG: Zufällig generieren und GEHEIM halten!
+curve=41218
+
+# =============================================================================
+# SECURITY (Kryptographie-Einstellungen)
+# =============================================================================
+[security]
+# Legacy Crypto (RSA-1024/2048, SHA1) - nur für Honeypots/Legacy
+legacy_crypto=false
+
+# Default Domain für Clients OHNE SNI
+default_domain=nossl.local
+
+# Security Intelligence Logging
+enabled=true
+log_path=/var/log/tlsgateNG/security
+log_file_size=100M
+log_total_size=5G
+
+# =============================================================================
+# CERTIFICATE (Zertifikat-Generierung)
+# =============================================================================
+[certificate]
+# Wildcard-Zertifikate (www.example.com → *.example.com)
+enable_wildcards=true
+
+# Subject Alternative Names (PFLICHT für moderne Browser!)
+enable_san=true
+
+# Gültigkeitsdauer (Max: 398 Tage)
+validity_days=200
+
+# Zertifikat-Caching
+cache_certificates=true
+
+# Second-Level TLD Datenbank (.co.uk, .com.au, etc.)
+second_level_tld_file=/etc/tlsgateNG/second-level-tlds.conf
+
+# =============================================================================
+# HTML (Response-Konfiguration)
+# =============================================================================
+[html]
+# Benutzerdefiniertes HTML Template (optional)
+#default_html=/etc/tlsgateNG/html/custom.html
+
+# Anti-Phishing Modus (alle Anfragen → HTTP 200)
+any-responses=false
+
+# =============================================================================
+# SERVER (Netzwerk-Konfiguration)
+# =============================================================================
+[server]
+# Bind-Adresse
+# WARNUNG: Niemals 0.0.0.0 oder :: in Produktion!
+#
+# IPv4-Server:
+listen_address=127.0.0.1
+#
+# IPv6-Server:
+#listen_address=::1
+
+# Ports
+http_port=80      # HTTP (Klartext)
+https_port=443    # HTTPS (TLS)
+auto_port=8080    # AUTO (MSG_PEEK Protokoll-Erkennung)
+
+# Worker-Threads (Empfehlung: CPU-Kerne)
+workers=4
+
+# Max Connections pro Worker
+# Total: workers × max_connections = 200.000
+max_connections=50000
+
+# =============================================================================
+# RUNTIME (Prozess-Einstellungen)
+# =============================================================================
+[runtime]
+daemonize=true
+verbose=false
+
+# Privilege Drop nach Start
+# EMPFOHLEN: Separaten User anlegen!
+#   useradd --system --no-create-home --shell /usr/sbin/nologin tlsgate
+user=tlsgate
+group=tlsgate
+
+# =============================================================================
+# DIRECTORIES (Verzeichnis-Struktur)
+# =============================================================================
+[directories]
+# Basis-Verzeichnis für CA-Struktur
+# Struktur: ca_dir/{rootCA,certs,index}/{RSA,ECDSA,SM2}/
+ca_dir=/opt/TLSGateNX
+
+# Bundles-Verzeichnis (vorgenerierte Keys)
+bundles_dir=/etc/tlsgateNG/bundles
+
+# =============================================================================
+# POOL (Keypool-Einstellungen)
+# =============================================================================
+[pool]
+# Keypool-Größe (nur Fallback wenn Poolgen nicht läuft)
+pool_size=1000
+
+# Shared Memory aktivieren (Keys vom Poolgen)
+# true = EMPFOHLEN - Keys aus SHM
+# false = Lokale Generierung (langsamer)
+use_shm=true
+
+# Server ist KEIN Poolgen!
+poolkeygen_mode=false
+
+# SHM Zertifikat-Index Kapazität
+# HINWEIS: Wird vom Poolgen festgelegt!
+#          Diese Einstellung nur für Start ohne Poolgen.
+certcache_capacity=30M
+
+# =============================================================================
+# INDEX (Zertifikat-Index)
+# =============================================================================
+[index]
+# Master-Modus für Zertifikat-Index
+#
+# Der Index-Master ist verantwortlich für:
+#   - Zertifikat-Erneuerung (automatisch bei Ablauf)
+#   - Zertifikat-Cleanup (alte Certs löschen)
+#   - Index-Persistierung (alle 5 Minuten)
+#
+# BEI MEHREREN INSTANZEN:
+#   - tlsgateNGv4: master=true  (EIN Master!)
+#   - tlsgateNGv6: master=false
+#
+# WARNUNG: Mehrere Master = Index-Korruption!
+master=true
+
+# =============================================================================
+# CA KONFIGURATION (Algorithmus-spezifisch)
+# =============================================================================
+[ca-RSA]
+sub_cert_path=/opt/TLSGateNX/rootCA/RSA/subca.crt
+sub_key_path=/opt/TLSGateNX/rootCA/RSA/subca.key
+root_cert_path=/opt/TLSGateNX/rootCA/RSA/rootca.crt
+# Optional: Cross-Signed für bessere Kompatibilität
+#sub_cs_cert_path=/opt/TLSGateNX/rootCA/RSA/subca.cs.crt
+
+[ca-ECDSA]
+sub_cert_path=/opt/TLSGateNX/rootCA/ECDSA/subca.crt
+sub_key_path=/opt/TLSGateNX/rootCA/ECDSA/subca.key
+root_cert_path=/opt/TLSGateNX/rootCA/ECDSA/rootca.crt
+
+[ca-SM2]
+sub_cert_path=/opt/TLSGateNX/rootCA/SM2/subca.crt
+sub_key_path=/opt/TLSGateNX/rootCA/SM2/subca.key
+root_cert_path=/opt/TLSGateNX/rootCA/SM2/rootca.crt
+
+# =============================================================================
+# LICENSE (Zukünftig)
+# =============================================================================
+[license]
+# Reserviert für zukünftige Hardware-gebundene Lizenzierung
+#key=XXXX-XXXX-XXXX-XXXX
+
+# =============================================================================
+# MULTI-INSTANZ SETUP (IPv4 + IPv6 + Poolgen)
+# =============================================================================
+#
+# Startreihenfolge:
+#   1. tlsgateNG-poolgen  (erstellt SHM, startet Watchdog)
+#   2. tlsgateNGv4        (Index-Master, Backup-Master)
+#   3. tlsgateNGv6        (Slave)
+#
+# Konfiguration:
+#
+# Poolgen (/etc/tlsgateNG/poolgen.conf):
+#   [pool]   poolkeygen_mode=true, use_shm=true
+#   [index]  master=false
+#   [backup] master=false
+#
+# IPv4-Server (/etc/tlsgateNG/tlsgateNG.conf):
+#   [pool]   poolkeygen_mode=false, use_shm=true
+#   [index]  master=true   ← Cert-Erneuerung
+#   [backup] master=true   ← Backups
+#   [server] listen_address=127.0.0.1
+#
+# IPv6-Server (/etc/tlsgateNG/tlsgateNG-v6.conf):
+#   [pool]   poolkeygen_mode=false, use_shm=true
+#   [index]  master=false
+#   [backup] master=false
+#   [server] listen_address=::1
+#
+# =============================================================================
+# SYSTEMD SERVICE
+# =============================================================================
+# /etc/systemd/system/tlsgateNGv4.service
+#
+# [Unit]
+# Description=TLSGate NG Server (IPv4)
+# After=tlsgateNG-poolgen.service
+# Requires=tlsgateNG-poolgen.service
+#
+# [Service]
+# Type=simple
+# ExecStart=/usr/local/bin/tlsgateNGv4 -c /etc/tlsgateNG/tlsgateNG.conf
+# Restart=on-failure
+# RestartSec=5
+#
+# # Privilege drop erfolgt nach Bind
+# User=root
+# Group=root
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+#
+# [Install]
+# WantedBy=multi-user.target
+#
+# =============================================================================
