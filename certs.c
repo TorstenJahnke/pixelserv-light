@@ -553,7 +553,12 @@ static int sslctx_tbl_check_and_flush(void)
     if (do_flush < 0) {
         rv = -1;
     } else {
+#if OPENSSL_VERSION_NUMBER >= 0x30400000L && !defined(ENABLE_TONGCHOU)
+        /* OpenSSL 3.4+ has Y2038-safe version */
+        SSL_CTX_flush_sessions_ex(g_sslctx, time(NULL));
+#else
         SSL_CTX_flush_sessions(g_sslctx, time(NULL));
+#endif
         atomic_store_explicit(&sslctx_tbl_last_flush, pixel_now, memory_order_relaxed);
         rv = 1;
     }
