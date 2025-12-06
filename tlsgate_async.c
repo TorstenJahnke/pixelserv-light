@@ -1,17 +1,20 @@
 /**
- * pixelserv-tls v3.0 - MULTI-THREADED ASYNC EVENT-DRIVEN ARCHITECTURE
+ * tlsgate v3.0 - MULTI-THREADED ASYNC EVENT-DRIVEN ARCHITECTURE
  *
  * COMPLETE REDESIGN FOR 10M CONCURRENT USERS + MULTI-CORE SCALING:
- * - One io_uring Ring per CPU core (parallel, lock-free)
+ * - One Event Loop (io_uring on Linux, kqueue on FreeBSD) per CPU core
  * - SO_REUSEPORT: Kernel distributes connections to all threads
  * - State machine driven connections (no thread-per-connection overhead)
  * - Lock-free connection pool (pre-allocated, shared across threads)
  * - Sub-microsecond latencies with all cores utilized
  *
- * ARCHITECTURE:
+ * PORTABLE ARCHITECTURE:
+ *   Linux: io_uring (batch I/O submissions, zero-copy)
+ *   FreeBSD: kqueue (event notification system)
+ *
  *   Main Thread: Start worker threads, manage lifecycle
  *   Worker Threads (1 per CPU core):
- *     - Each has own io_uring ring (lock-free, no contention)
+ *     - Each has own event loop (lock-free, no contention)
  *     - Each accepts connections via SO_REUSEPORT
  *     - Kernel automatically load-balances incoming connections
  *     - Processes all I/O for its connections asynchronously
@@ -49,7 +52,7 @@
 
 #include "async_connection.h"
 #include "certs.h"
-#include "io_uring_async.h"
+#include "event_loop.h"
 #include "logger.h"
 #include "util.h"
 
@@ -86,7 +89,7 @@ typedef struct {
     int thread_id;
     int cpu_id;
     pthread_t tid;
-    io_uring_wrapper_t *uring;
+    event_loop_t *uring;
     _Atomic uint64_t connections_handled;
 } worker_thread_t;
 
@@ -126,7 +129,7 @@ static void setup_signal_handlers(void) {
  * ============================================================================
  */
 
-static int handle_accept_completion(io_uring_wrapper_t *uring, async_connection_t *conn, int result) {
+static int handle_accept_completion(event_loop_t *uring, async_connection_t *conn, int result) {
     if (result < 0) {
         log_msg(LGG_DEBUG, "accept() error: %d", result);
         conn_pool_release(conn_pool, conn);
@@ -151,22 +154,22 @@ static int handle_accept_completion(io_uring_wrapper_t *uring, async_connection_
 
     if (is_https) {
         conn_state_transition(new_conn, CONN_STATE_TLS_HANDSHAKE);
-        io_uring_async_read(uring, new_conn, new_conn->http.request_buf, 4096);
+        event_loop_read(uring, new_conn, new_conn->http.request_buf, 4096);
     } else {
         conn_state_transition(new_conn, CONN_STATE_HTTP_REQUEST_READ);
-        io_uring_async_read(uring, new_conn, new_conn->http.request_buf, 4096);
+        event_loop_read(uring, new_conn, new_conn->http.request_buf, 4096);
     }
 
     /* Re-submit accept for next connection */
-    io_uring_async_accept(uring, conn->fd, conn);
+    event_loop_accept(uring, conn->fd, conn);
     return 0;
 }
 
-static int handle_read_completion(io_uring_wrapper_t *uring, async_connection_t *conn, int result) {
+static int handle_read_completion(event_loop_t *uring, async_connection_t *conn, int result) {
     if (result <= 0) {
         log_msg(LGG_DEBUG, "read() error or EOF: fd=%d result=%d", conn->fd, result);
         conn_state_transition(conn, CONN_STATE_CLOSING);
-        io_uring_async_close(uring, conn);
+        event_loop_close(uring, conn);
         return -1;
     }
 
@@ -185,7 +188,7 @@ static int handle_read_completion(io_uring_wrapper_t *uring, async_connection_t 
             /* Error during handshake */
             log_msg(LGG_WARNING, "TLS handshake failed");
             conn_state_transition(conn, CONN_STATE_ERROR);
-            io_uring_async_close(uring, conn);
+            event_loop_close(uring, conn);
             return -1;
         }
     }
@@ -201,7 +204,7 @@ static int handle_read_completion(io_uring_wrapper_t *uring, async_connection_t 
             if (bytes_read < 0) {
                 log_msg(LGG_WARNING, "TLS read error");
                 conn_state_transition(conn, CONN_STATE_ERROR);
-                io_uring_async_close(uring, conn);
+                event_loop_close(uring, conn);
                 return -1;
             } else if (bytes_read == 0) {
                 /* Need more I/O */
@@ -213,7 +216,7 @@ static int handle_read_completion(io_uring_wrapper_t *uring, async_connection_t 
             log_msg(LGG_WARNING, "HTTP request buffer overflow");
             STAT_INC(ers);
             conn_state_transition(conn, CONN_STATE_ERROR);
-            io_uring_async_close(uring, conn);
+            event_loop_close(uring, conn);
             return -1;
         }
 
@@ -226,7 +229,7 @@ static int handle_read_completion(io_uring_wrapper_t *uring, async_connection_t 
             if (conn->is_https) {
                 tls_write_async(conn, conn->http.response_buf, conn->http.response_len, uring);
             } else {
-                io_uring_async_write(uring, conn, conn->http.response_buf, conn->http.response_len);
+                event_loop_write(uring, conn, conn->http.response_buf, conn->http.response_len);
             }
             return 0;
         }
@@ -236,7 +239,7 @@ static int handle_read_completion(io_uring_wrapper_t *uring, async_connection_t 
             tls_read_async(conn, conn->http.request_buf + conn->http.request_len,
                           HTTP_BUFFER_SIZE - conn->http.request_len, uring);
         } else {
-            io_uring_async_read(uring, conn,
+            event_loop_read(uring, conn,
                     conn->http.request_buf + conn->http.request_len,
                     HTTP_BUFFER_SIZE - conn->http.request_len);
         }
@@ -248,11 +251,11 @@ static int handle_read_completion(io_uring_wrapper_t *uring, async_connection_t 
     return -1;
 }
 
-static int handle_write_completion(io_uring_wrapper_t *uring, async_connection_t *conn, int result) {
+static int handle_write_completion(event_loop_t *uring, async_connection_t *conn, int result) {
     if (result <= 0) {
         log_msg(LGG_DEBUG, "write() error: fd=%d result=%d", conn->fd, result);
         conn_state_transition(conn, CONN_STATE_CLOSING);
-        io_uring_async_close(uring, conn);
+        event_loop_close(uring, conn);
         return -1;
     }
 
@@ -275,13 +278,13 @@ static int handle_write_completion(io_uring_wrapper_t *uring, async_connection_t
                 /* Done sending */
                 STAT_INC(gif);
                 conn_state_transition(conn, CONN_STATE_CLOSING);
-                io_uring_async_close(uring, conn);
+                event_loop_close(uring, conn);
             }
         } else if (tls_ret < 0) {
             /* Error */
             log_msg(LGG_WARNING, "TLS write error");
             conn_state_transition(conn, CONN_STATE_ERROR);
-            io_uring_async_close(uring, conn);
+            event_loop_close(uring, conn);
         }
         /* tls_ret == 0: Need more I/O, queued by tls_write_async() */
         return 0;
@@ -291,7 +294,7 @@ static int handle_write_completion(io_uring_wrapper_t *uring, async_connection_t
     conn->http.response_sent += result;
 
     if (conn->http.response_sent < conn->http.response_len) {
-        io_uring_async_write(uring, conn,
+        event_loop_write(uring, conn,
                 conn->http.response_buf + conn->http.response_sent,
                 conn->http.response_len - conn->http.response_sent);
         return 0;
@@ -299,12 +302,12 @@ static int handle_write_completion(io_uring_wrapper_t *uring, async_connection_t
 
     STAT_INC(gif);
     conn_state_transition(conn, CONN_STATE_CLOSING);
-    io_uring_async_close(uring, conn);
+    event_loop_close(uring, conn);
 
     return 0;
 }
 
-static int handle_close_completion(io_uring_wrapper_t *uring, async_connection_t *conn, int result) {
+static int handle_close_completion(event_loop_t *uring, async_connection_t *conn, int result) {
     (void)uring;
     (void)result;
 
@@ -313,7 +316,7 @@ static int handle_close_completion(io_uring_wrapper_t *uring, async_connection_t
     return 0;
 }
 
-static int io_completion_handler(io_uring_wrapper_t *uring, async_connection_t *conn, int result) {
+static int io_completion_handler(event_loop_t *uring, async_connection_t *conn, int result) {
     if (!conn) {
         log_msg(LGG_ERR, "Null connection in I/O completion!");
         return -1;
@@ -406,10 +409,10 @@ static void *worker_thread_main(void *arg) {
         log_msg(LGG_WARNING, "Failed to set CPU affinity for worker %d", worker->thread_id);
     }
 
-    /* Create io_uring ring for this worker */
-    worker->uring = io_uring_async_init(URING_QUEUE_DEPTH);
+    /* Create event loop for this worker */
+    worker->uring = event_loop_init(URING_QUEUE_DEPTH);
     if (!worker->uring) {
-        log_msg(LGG_ERR, "Failed to initialize io_uring for worker %d", worker->thread_id);
+        log_msg(LGG_ERR, "Failed to initialize event loop for worker %d", worker->thread_id);
         return NULL;
     }
 
@@ -417,18 +420,18 @@ static void *worker_thread_main(void *arg) {
     async_connection_t *http_listener = conn_pool_acquire(conn_pool, listen_fd_http);
     if (!http_listener) {
         log_msg(LGG_ERR, "Failed to allocate HTTP listener for worker %d", worker->thread_id);
-        io_uring_async_destroy(worker->uring);
+        event_loop_destroy(worker->uring);
         return NULL;
     }
     http_listener->fd = listen_fd_http;
-    io_uring_async_accept(worker->uring, listen_fd_http, http_listener);
+    event_loop_accept(worker->uring, listen_fd_http, http_listener);
 
     if (listen_fd_https >= 0) {
         async_connection_t *https_listener = conn_pool_acquire(conn_pool, listen_fd_https);
         if (https_listener) {
             https_listener->fd = listen_fd_https;
             https_listener->is_https = 1;
-            io_uring_async_accept(worker->uring, listen_fd_https, https_listener);
+            event_loop_accept(worker->uring, listen_fd_https, https_listener);
         }
     }
 
@@ -441,14 +444,14 @@ static void *worker_thread_main(void *arg) {
             reload_requested = 0;
         }
 
-        int num_events = io_uring_async_wait(worker->uring, -1, io_completion_handler);
+        int num_events = event_loop_wait(worker->uring, -1, io_completion_handler);
 
         if (num_events < 0 && errno == EINTR) {
             continue;
         }
 
         if (num_events < 0) {
-            log_msg(LGG_ERR, "io_uring_async_wait failed in worker %d: %m", worker->thread_id);
+            log_msg(LGG_ERR, "event_loop_wait failed in worker %d: %m", worker->thread_id);
             break;
         }
 
@@ -458,7 +461,7 @@ static void *worker_thread_main(void *arg) {
     log_msg(LGG_NOTICE, "Worker thread %d shutting down (handled %lu connections)",
             worker->thread_id, atomic_load(&worker->connections_handled));
 
-    io_uring_async_destroy(worker->uring);
+    event_loop_destroy(worker->uring);
     return NULL;
 }
 

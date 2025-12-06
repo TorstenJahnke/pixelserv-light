@@ -1,5 +1,5 @@
 #include "async_connection.h"
-#include "io_uring_async.h"
+#include "event_loop.h"
 #include "logger.h"
 #include "util.h"
 #include <stdlib.h>
@@ -344,7 +344,7 @@ void http_generate_response(http_state_t *http) {
  *  -1 = error, transition to ERROR
  */
 int tls_accept_async(void *ssl_ctx, async_connection_t *conn,
-                     io_uring_wrapper_t *uring) {
+                     event_loop_t *uring) {
     SSL_CTX *ctx = (SSL_CTX *)ssl_ctx;
     if (!ssl_ctx || !conn || conn->fd < 0) {
         log_msg(LGG_ERR, "Invalid TLS accept args");
@@ -377,14 +377,14 @@ int tls_accept_async(void *ssl_ctx, async_connection_t *conn,
     case SSL_ERROR_WANT_READ:
         /* Need to wait for socket readable */
         if (uring) {
-            io_uring_async_read(uring, conn, (char *)&conn->ssl, 1);
+            event_loop_read(uring, conn, (char *)&conn->ssl, 1);
         }
         return 0;  /* Continue in TLS_HANDSHAKE state */
 
     case SSL_ERROR_WANT_WRITE:
         /* Need to wait for socket writable */
         if (uring) {
-            io_uring_async_write(uring, conn, (const char *)&conn->ssl, 1);
+            event_loop_write(uring, conn, (const char *)&conn->ssl, 1);
         }
         return 0;  /* Continue in TLS_HANDSHAKE state */
 
@@ -410,7 +410,7 @@ int tls_accept_async(void *ssl_ctx, async_connection_t *conn,
  *  -1 = error, transition to ERROR
  */
 int tls_read_async(async_connection_t *conn, char *buf, size_t len,
-                   io_uring_wrapper_t *uring) {
+                   event_loop_t *uring) {
     if (!conn || !conn->ssl || !buf || len == 0) {
         log_msg(LGG_ERR, "Invalid TLS read args");
         return -1;
@@ -430,14 +430,14 @@ int tls_read_async(async_connection_t *conn, char *buf, size_t len,
     case SSL_ERROR_WANT_READ:
         /* Need to wait for socket readable */
         if (uring) {
-            io_uring_async_read(uring, conn, buf, len);
+            event_loop_read(uring, conn, buf, len);
         }
         return 0;  /* Continue in current state */
 
     case SSL_ERROR_WANT_WRITE:
         /* Need to send pending write (internal TLS state) */
         if (uring) {
-            io_uring_async_write(uring, conn, (const char *)buf, 1);
+            event_loop_write(uring, conn, (const char *)buf, 1);
         }
         return 0;  /* Continue in current state */
 
@@ -463,7 +463,7 @@ int tls_read_async(async_connection_t *conn, char *buf, size_t len,
  *  -1 = error, transition to ERROR
  */
 int tls_write_async(async_connection_t *conn, const char *buf, size_t len,
-                    io_uring_wrapper_t *uring) {
+                    event_loop_t *uring) {
     if (!conn || !conn->ssl || !buf || len == 0) {
         log_msg(LGG_ERR, "Invalid TLS write args");
         return -1;
@@ -483,14 +483,14 @@ int tls_write_async(async_connection_t *conn, const char *buf, size_t len,
     case SSL_ERROR_WANT_WRITE:
         /* Need to wait for socket writable */
         if (uring) {
-            io_uring_async_write(uring, conn, buf, len);
+            event_loop_write(uring, conn, buf, len);
         }
         return 0;  /* Continue in current state */
 
     case SSL_ERROR_WANT_READ:
         /* Need to receive pending data (internal TLS state) */
         if (uring) {
-            io_uring_async_read(uring, conn, (char *)buf, 1);
+            event_loop_read(uring, conn, (char *)buf, 1);
         }
         return 0;  /* Continue in current state */
 

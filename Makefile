@@ -129,7 +129,26 @@ endif
 # Source Files
 # =============================================================================
 
-SRCS := tlsgate_async.c certs.c logger.c util.c async_connection.c io_uring_async.c
+# Common sources for all platforms
+SRCS := tlsgate_async.c certs.c logger.c util.c async_connection.c
+
+# Platform-specific event loop backend
+ifeq ($(UNAME_S),Linux)
+    SRCS += io_uring_backend.c
+    CFLAGS += -DHAVE_IO_URING
+    $(info Using io_uring backend for Linux)
+else ifeq ($(UNAME_S),FreeBSD)
+    SRCS += kqueue_backend.c
+    CFLAGS += -DHAVE_KQUEUE
+    $(info Using kqueue backend for FreeBSD)
+else ifeq ($(UNAME_S),Darwin)
+    SRCS += kqueue_backend.c
+    CFLAGS += -DHAVE_KQUEUE
+    $(info Using kqueue backend for macOS)
+else
+    $(error Unsupported platform: $(UNAME_S). Supported: Linux, FreeBSD, Darwin)
+endif
+
 OBJS := $(SRCS:.c=.o)
 
 # Build directory for sanitizer builds
@@ -580,9 +599,10 @@ help:
 # Dependencies
 # =============================================================================
 
-tlsgate_async.o: tlsgate_async.c async_connection.h io_uring_async.h util.h certs.h logger.h compat.h
+tlsgate_async.o: tlsgate_async.c event_loop.h async_connection.h util.h certs.h logger.h compat.h
 async_connection.o: async_connection.c async_connection.h util.h logger.h
-io_uring_async.o: io_uring_async.c io_uring_async.h logger.h compat.h
+io_uring_backend.o: io_uring_backend.c event_loop.h async_connection.h logger.h compat.h
+kqueue_backend.o: kqueue_backend.c event_loop.h async_connection.h logger.h compat.h
 certs.o: certs.c certs.h util.h logger.h compat.h
 logger.o: logger.c logger.h
 util.o: util.c util.h compat.h
