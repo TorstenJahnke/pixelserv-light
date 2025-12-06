@@ -36,6 +36,8 @@ stamp-h1
 .deps/
 
 # Built binaries
+tlsgate
+tlsgate-test
 pixelserv-tls
 pixelserv-tls-test
 analyze.log

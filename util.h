@@ -109,56 +109,80 @@
 # define TESTPRINT(x,y...)
 #endif
 
-// cross-thread count variables
-extern volatile sig_atomic_t count; // req
+/* Cross-thread count variables - Cache-Line Aligned (64 bytes)
+ * IMPORTANT: Each counter is padded to 64 bytes to prevent false-sharing
+ * on multi-core systems. This ensures atomic increments on different cores
+ * don't invalidate the same cache line, improving performance for 10M+ users.
+ */
+#define CACHELINE_SIZE 64
+
+/* HTTP Request Counters - Group 1 */
+extern volatile sig_atomic_t count __attribute__((aligned(CACHELINE_SIZE))); // req
 extern volatile sig_atomic_t avg; // cumulative moving average request size
 extern volatile sig_atomic_t _act; // avg count (updated at time of average calculation)
 extern volatile sig_atomic_t rmx; // maximum encountered request size
-extern volatile sig_atomic_t _tct; // time count
+
+/* Request Timing Counters - Group 2 */
+extern volatile sig_atomic_t _tct __attribute__((aligned(CACHELINE_SIZE))); // time count
 extern volatile sig_atomic_t tav; // cumulative moving average time in msec
 extern volatile sig_atomic_t tmx; // max time in msec
-extern volatile sig_atomic_t ers;
-extern volatile sig_atomic_t tmo;
-extern volatile sig_atomic_t cls;
-extern volatile sig_atomic_t nou;
-extern volatile sig_atomic_t pth;
-extern volatile sig_atomic_t nfe;
-extern volatile sig_atomic_t ufe;
-extern volatile sig_atomic_t gif;
-extern volatile sig_atomic_t bad;
-extern volatile sig_atomic_t txt;
-extern volatile sig_atomic_t jpg;
-extern volatile sig_atomic_t png;
-extern volatile sig_atomic_t swf;
-extern volatile sig_atomic_t ico;
-extern volatile sig_atomic_t sta; // so meta!
-extern volatile sig_atomic_t stt;
-extern volatile sig_atomic_t noc;
-extern volatile sig_atomic_t rdr;
-extern volatile sig_atomic_t pst;
-extern volatile sig_atomic_t hed;
-extern volatile sig_atomic_t opt;
-extern volatile sig_atomic_t cly;
 
-extern volatile sig_atomic_t slh;
-extern volatile sig_atomic_t slm;
-extern volatile sig_atomic_t sle;
-extern volatile sig_atomic_t slc;
-extern volatile sig_atomic_t slu;
-extern volatile sig_atomic_t uca;
-extern volatile sig_atomic_t ucb;
-extern volatile sig_atomic_t uce;
-extern volatile sig_atomic_t ush;
-extern volatile sig_atomic_t kcc;
-extern volatile sig_atomic_t kmx;
-extern volatile sig_atomic_t kct;
-extern volatile float kvg;
-extern volatile sig_atomic_t krq;
-extern volatile sig_atomic_t clt;
-extern volatile sig_atomic_t v13;
-extern volatile sig_atomic_t v12;
-extern volatile sig_atomic_t v10;
-extern volatile sig_atomic_t zrt;
+/* Error & Failure Counters - Group 3 */
+extern volatile sig_atomic_t ers __attribute__((aligned(CACHELINE_SIZE))); // errors
+extern volatile sig_atomic_t tmo; // timeouts
+extern volatile sig_atomic_t cls; // client closures
+extern volatile sig_atomic_t nou; // no URL
+
+/* Path Counters - Group 4 */
+extern volatile sig_atomic_t pth __attribute__((aligned(CACHELINE_SIZE))); // bad path
+extern volatile sig_atomic_t nfe; // no file extension
+extern volatile sig_atomic_t ufe; // unknown file extension
+
+/* Response Type Counters - Group 5 */
+extern volatile sig_atomic_t gif __attribute__((aligned(CACHELINE_SIZE))); // GIF responses
+extern volatile sig_atomic_t bad; // BAD responses
+extern volatile sig_atomic_t txt; // TXT responses
+extern volatile sig_atomic_t jpg; // JPG responses
+extern volatile sig_atomic_t png; // PNG responses
+extern volatile sig_atomic_t swf; // SWF responses
+extern volatile sig_atomic_t ico; // ICO responses
+
+/* Stats Page Counters - Group 6 */
+extern volatile sig_atomic_t sta __attribute__((aligned(CACHELINE_SIZE))); // stats HTML
+extern volatile sig_atomic_t stt; // stats text
+extern volatile sig_atomic_t noc; // 204 no content
+extern volatile sig_atomic_t rdr; // redirects
+
+/* HTTP Method Counters - Group 7 */
+extern volatile sig_atomic_t pst __attribute__((aligned(CACHELINE_SIZE))); // POST
+extern volatile sig_atomic_t hed; // HEAD
+extern volatile sig_atomic_t opt; // OPTIONS
+extern volatile sig_atomic_t cly; // client closure
+
+/* TLS/SSL Counters - Group 8 */
+extern volatile sig_atomic_t slh __attribute__((aligned(CACHELINE_SIZE))); // SSL handshake hit
+extern volatile sig_atomic_t slm; // SSL cache miss
+extern volatile sig_atomic_t sle; // SSL error
+extern volatile sig_atomic_t slc; // SSL context count
+extern volatile sig_atomic_t slu; // SSL unknown
+extern volatile sig_atomic_t uca; // cert update A
+extern volatile sig_atomic_t ucb; // cert update B
+extern volatile sig_atomic_t uce; // cert update E
+extern volatile sig_atomic_t ush; // cert update SH
+
+/* Cert Cache Counters - Group 9 */
+extern volatile sig_atomic_t kcc __attribute__((aligned(CACHELINE_SIZE))); // cert cache count
+extern volatile sig_atomic_t kmx; // cert cache max
+extern volatile sig_atomic_t kct; // cert cache time
+extern volatile float kvg; // cert avg reuse
+extern volatile sig_atomic_t krq; // cert requests
+extern volatile sig_atomic_t clt; // client timeout
+
+/* TLS Version Counters - Group 10 */
+extern volatile sig_atomic_t v13 __attribute__((aligned(CACHELINE_SIZE))); // TLS 1.3
+extern volatile sig_atomic_t v12; // TLS 1.2
+extern volatile sig_atomic_t v10; // TLS 1.0
+extern volatile sig_atomic_t zrt; // 0-RTT
 
 // Certificate configuration
 extern int cert_validity_days;  // certificate validity in days

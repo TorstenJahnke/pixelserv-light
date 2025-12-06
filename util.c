@@ -5,38 +5,66 @@
 #include <execinfo.h>
 #endif
 
-// stats data
-// note that child processes inherit a snapshot copy
-// public data (should probably change to a struct)
-volatile sig_atomic_t count = 0;
+/* Stats data - Cache-Line Aligned to prevent false-sharing
+ * Each counter group is aligned to 64-byte cache-line boundary to ensure
+ * atomic increments from different cores don't cause cache-line invalidation
+ * on other cores. This is critical for performance with 10M+ concurrent users.
+ *
+ * Note: Child processes inherit a snapshot copy
+ */
+
+/* HTTP Request Counters - Group 1 */
+volatile sig_atomic_t count __attribute__((aligned(64))) = 0;
 volatile sig_atomic_t avg = 0;
+volatile sig_atomic_t _act = 0;
 volatile sig_atomic_t rmx = 0;
+char _pad0[64 - 4*sizeof(sig_atomic_t)] = {0};
+
+/* Request Timing Counters - Group 2 */
+volatile sig_atomic_t _tct __attribute__((aligned(64))) = 0;
 volatile sig_atomic_t tav = 0;
 volatile sig_atomic_t tmx = 0;
-volatile sig_atomic_t ers = 0;
+char _pad1[64 - 3*sizeof(sig_atomic_t)] = {0};
+
+/* Error & Failure Counters - Group 3 */
+volatile sig_atomic_t ers __attribute__((aligned(64))) = 0;
 volatile sig_atomic_t tmo = 0;
 volatile sig_atomic_t cls = 0;
 volatile sig_atomic_t nou = 0;
-volatile sig_atomic_t pth = 0;
+char _pad2[64 - 4*sizeof(sig_atomic_t)] = {0};
+
+/* Path Counters - Group 4 */
+volatile sig_atomic_t pth __attribute__((aligned(64))) = 0;
 volatile sig_atomic_t nfe = 0;
 volatile sig_atomic_t ufe = 0;
-volatile sig_atomic_t gif = 0;
+char _pad3[64 - 3*sizeof(sig_atomic_t)] = {0};
+
+/* Response Type Counters - Group 5 */
+volatile sig_atomic_t gif __attribute__((aligned(64))) = 0;
 volatile sig_atomic_t bad = 0;
 volatile sig_atomic_t txt = 0;
 volatile sig_atomic_t jpg = 0;
 volatile sig_atomic_t png = 0;
 volatile sig_atomic_t swf = 0;
 volatile sig_atomic_t ico = 0;
-volatile sig_atomic_t sta = 0;
+char _pad4[64 - 7*sizeof(sig_atomic_t)] = {0};
+
+/* Stats Page Counters - Group 6 */
+volatile sig_atomic_t sta __attribute__((aligned(64))) = 0;
 volatile sig_atomic_t stt = 0;
 volatile sig_atomic_t noc = 0;
 volatile sig_atomic_t rdr = 0;
-volatile sig_atomic_t pst = 0;
+char _pad5[64 - 4*sizeof(sig_atomic_t)] = {0};
+
+/* HTTP Method Counters - Group 7 */
+volatile sig_atomic_t pst __attribute__((aligned(64))) = 0;
 volatile sig_atomic_t hed = 0;
 volatile sig_atomic_t opt = 0;
 volatile sig_atomic_t cly = 0;
+char _pad6[64 - 4*sizeof(sig_atomic_t)] = {0};
 
-volatile sig_atomic_t slh = 0;
+/* TLS/SSL Counters - Group 8 */
+volatile sig_atomic_t slh __attribute__((aligned(64))) = 0;
 volatile sig_atomic_t slm = 0;
 volatile sig_atomic_t sle = 0;
 volatile sig_atomic_t slc = 0;
@@ -45,15 +73,23 @@ volatile sig_atomic_t uca = 0;
 volatile sig_atomic_t ucb = 0;
 volatile sig_atomic_t uce = 0;
 volatile sig_atomic_t ush = 0;
-volatile sig_atomic_t kcc = 0;
+char _pad7[64 - 9*sizeof(sig_atomic_t)] = {0};
+
+/* Cert Cache Counters - Group 9 */
+volatile sig_atomic_t kcc __attribute__((aligned(64))) = 0;
 volatile sig_atomic_t kmx = 0;
+volatile sig_atomic_t kct = 0;
 volatile float kvg = 0.0;
 volatile sig_atomic_t krq = 0;
 volatile sig_atomic_t clt = 0;
-volatile sig_atomic_t v13 = 0;
+char _pad8[64 - (3*sizeof(sig_atomic_t) + sizeof(float) + sizeof(sig_atomic_t))] = {0};
+
+/* TLS Version Counters - Group 10 */
+volatile sig_atomic_t v13 __attribute__((aligned(64))) = 0;
 volatile sig_atomic_t v12 = 0;
 volatile sig_atomic_t v10 = 0;
 volatile sig_atomic_t zrt = 0;
+char _pad9[64 - 4*sizeof(sig_atomic_t)] = {0};
 
 // Certificate configuration
 int cert_validity_days = DEFAULT_CERT_VALIDITY_DAYS;
