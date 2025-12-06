@@ -132,6 +132,11 @@ endif
 SRCS := pixelserv.c socket_handler.c certs.c logger.c util.c eventloop.c
 OBJS := $(SRCS:.c=.o)
 
+# TLSGate (ultra-scale architecture)
+TLSGATE_SRCS := src/tlsgate.c src/connection.c src/buffer_pool.c src/worker.c src/response.c
+TLSGATE_OBJS := $(TLSGATE_SRCS:.c=.o)
+TLSGATE_BIN := tlsgate
+
 # Build directory for sanitizer builds
 OBJDIR := build
 
@@ -199,6 +204,7 @@ endif
 .PHONY: address thread ubsan analyze secure memcheck fullcheck headercheck
 .PHONY: production static static-ssl tongchou bsi-strict
 .PHONY: setup-test-ca clean-test-ca
+.PHONY: tlsgate tlsgate-debug tlsgate-production
 
 all: $(PROGNAME)
 	@echo ""
@@ -226,6 +232,29 @@ $(PROGNAME): $(OBJS)
 # Debug build
 debug:
 	$(MAKE) DEBUG=1 all
+
+# =============================================================================
+# TLSGate - Ultra-Scale Architecture (10M+ concurrent connections)
+# =============================================================================
+
+tlsgate: $(TLSGATE_OBJS)
+	$(CC) $(CFLAGS) -o $(TLSGATE_BIN) $^ $(LDFLAGS)
+	@echo ""
+	@echo "Built $(TLSGATE_BIN) - Ultra-Scale TLS Server"
+	@echo "  Architecture: Event-driven, lock-free"
+	@echo "  Target: 10M+ concurrent connections"
+	@echo ""
+
+tlsgate-debug:
+	$(MAKE) DEBUG=1 tlsgate
+
+tlsgate-production: CFLAGS += -O3 -march=native -flto -DNDEBUG
+tlsgate-production: LDFLAGS += -flto
+tlsgate-production: tlsgate
+	strip $(TLSGATE_BIN)
+
+src/%.o: src/%.c
+	$(CC) $(CFLAGS) -I include -c -o $@ $<
 
 # =============================================================================
 # Static Builds
@@ -499,6 +528,7 @@ uninstall:
 
 clean:
 	@rm -f $(OBJS) $(PROGNAME) $(TEST_BIN) config.h analyze.log
+	@rm -f $(TLSGATE_OBJS) $(TLSGATE_BIN)
 	@rm -rf $(OBJDIR)
 	@echo "Cleaned."
 
