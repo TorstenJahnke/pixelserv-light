@@ -129,7 +129,7 @@ endif
 # Source Files
 # =============================================================================
 
-SRCS := pixelserv.c socket_handler.c certs.c logger.c util.c eventloop.c
+SRCS := pixelserv.c socket_handler.c certs.c logger.c util.c eventloop.c async_connection.c io_uring_async.c
 OBJS := $(SRCS:.c=.o)
 
 # Build directory for sanitizer builds
