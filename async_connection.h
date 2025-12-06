@@ -8,6 +8,9 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
+/* Forward declarations to avoid circular includes */
+typedef struct io_uring_wrapper io_uring_wrapper_t;
+
 /**
  * ASYNC CONNECTION STATE MACHINE
  *
@@ -159,5 +162,10 @@ int http_request_append_data(http_state_t *http, const char *data, size_t len);
 int http_request_is_complete(http_state_t *http);
 void http_parse_request(http_state_t *http);
 void http_generate_response(http_state_t *http);
+
+/* Async TLS operations (non-blocking with io_uring polling) */
+int tls_accept_async(void *ssl_ctx, async_connection_t *conn, io_uring_wrapper_t *uring);
+int tls_read_async(async_connection_t *conn, char *buf, size_t len, io_uring_wrapper_t *uring);
+int tls_write_async(async_connection_t *conn, const char *buf, size_t len, io_uring_wrapper_t *uring);
 
 #endif // ASYNC_CONNECTION_H

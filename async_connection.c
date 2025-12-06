@@ -1,10 +1,13 @@
 #include "async_connection.h"
+#include "io_uring_async.h"
 #include "logger.h"
 #include "util.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #define HTTP_BUFFER_SIZE 131072  /* 128KB pre-allocated */
 #define CONN_POOL_DEFAULT_SIZE 1048576  /* 1M connections */
@@ -327,4 +330,180 @@ void http_generate_response(http_state_t *http) {
 
     http->response_len = header_len + gif_len;
     http->response_sent = 0;
+}
+
+/* =============================================================================
+ * ASYNC TLS OPERATIONS
+ * ============================================================================= */
+
+/**
+ * Perform async SSL_accept()
+ * Returns:
+ *   1 = handshake complete, transition to TLS_HANDSHAKE_DONE
+ *   0 = need more I/O (poll queued), stay in TLS_HANDSHAKE
+ *  -1 = error, transition to ERROR
+ */
+int tls_accept_async(void *ssl_ctx, async_connection_t *conn,
+                     io_uring_wrapper_t *uring) {
+    SSL_CTX *ctx = (SSL_CTX *)ssl_ctx;
+    if (!ssl_ctx || !conn || conn->fd < 0) {
+        log_msg(LGG_ERR, "Invalid TLS accept args");
+        return -1;
+    }
+
+    /* Create SSL object on first attempt */
+    if (!conn->ssl) {
+        conn->ssl = SSL_new(ctx);
+        if (!conn->ssl) {
+            log_msg(LGG_ERR, "Failed to create SSL object: %s",
+                    ERR_error_string(ERR_get_error(), NULL));
+            return -1;
+        }
+        SSL_set_fd(conn->ssl, conn->fd);
+    }
+
+    /* Attempt SSL_accept() */
+    int ret = SSL_accept(conn->ssl);
+    if (ret > 0) {
+        /* Handshake complete */
+        conn->ssl_handshake_done = 1;
+        log_msg(LGG_DEBUG, "TLS handshake complete for fd %d", conn->fd);
+        return 1;
+    }
+
+    /* Handle SSL_accept errors */
+    int ssl_err = SSL_get_error(conn->ssl, ret);
+    switch (ssl_err) {
+    case SSL_ERROR_WANT_READ:
+        /* Need to wait for socket readable */
+        if (uring) {
+            io_uring_async_read(uring, conn, (char *)&conn->ssl, 1);
+        }
+        return 0;  /* Continue in TLS_HANDSHAKE state */
+
+    case SSL_ERROR_WANT_WRITE:
+        /* Need to wait for socket writable */
+        if (uring) {
+            io_uring_async_write(uring, conn, (const char *)&conn->ssl, 1);
+        }
+        return 0;  /* Continue in TLS_HANDSHAKE state */
+
+    case SSL_ERROR_NONE:
+        /* Connection closed cleanly (SSL_accept returned 0) */
+        log_msg(LGG_WARNING, "TLS handshake connection closed (fd %d)", conn->fd);
+        return -1;
+
+    case SSL_ERROR_SSL:
+    case SSL_ERROR_SYSCALL:
+    default:
+        log_msg(LGG_ERR, "TLS handshake error (fd %d): %s",
+                conn->fd, ERR_error_string(ERR_get_error(), NULL));
+        return -1;
+    }
+}
+
+/**
+ * Perform async SSL_read()
+ * Returns:
+ *   > 0 = bytes read, call http_request_append_data()
+ *   0 = need more I/O (poll queued), stay in HTTP_REQUEST_READ
+ *  -1 = error, transition to ERROR
+ */
+int tls_read_async(async_connection_t *conn, char *buf, size_t len,
+                   io_uring_wrapper_t *uring) {
+    if (!conn || !conn->ssl || !buf || len == 0) {
+        log_msg(LGG_ERR, "Invalid TLS read args");
+        return -1;
+    }
+
+    /* Attempt SSL_read() */
+    int ret = SSL_read(conn->ssl, buf, len);
+    if (ret > 0) {
+        /* Data received */
+        conn->bytes_received += ret;
+        return ret;
+    }
+
+    /* Handle SSL_read errors */
+    int ssl_err = SSL_get_error(conn->ssl, ret);
+    switch (ssl_err) {
+    case SSL_ERROR_WANT_READ:
+        /* Need to wait for socket readable */
+        if (uring) {
+            io_uring_async_read(uring, conn, buf, len);
+        }
+        return 0;  /* Continue in current state */
+
+    case SSL_ERROR_WANT_WRITE:
+        /* Need to send pending write (internal TLS state) */
+        if (uring) {
+            io_uring_async_write(uring, conn, (const char *)buf, 1);
+        }
+        return 0;  /* Continue in current state */
+
+    case SSL_ERROR_NONE:
+        /* Connection closed cleanly */
+        log_msg(LGG_DEBUG, "TLS read: connection closed (fd %d)", conn->fd);
+        return -1;
+
+    case SSL_ERROR_SSL:
+    case SSL_ERROR_SYSCALL:
+    default:
+        log_msg(LGG_ERR, "TLS read error (fd %d): %s",
+                conn->fd, ERR_error_string(ERR_get_error(), NULL));
+        return -1;
+    }
+}
+
+/**
+ * Perform async SSL_write()
+ * Returns:
+ *   > 0 = bytes written, update response_sent
+ *   0 = need more I/O (poll queued), stay in HTTP_RESPONSE_WRITE
+ *  -1 = error, transition to ERROR
+ */
+int tls_write_async(async_connection_t *conn, const char *buf, size_t len,
+                    io_uring_wrapper_t *uring) {
+    if (!conn || !conn->ssl || !buf || len == 0) {
+        log_msg(LGG_ERR, "Invalid TLS write args");
+        return -1;
+    }
+
+    /* Attempt SSL_write() */
+    int ret = SSL_write(conn->ssl, buf, len);
+    if (ret > 0) {
+        /* Data sent */
+        conn->bytes_sent += ret;
+        return ret;
+    }
+
+    /* Handle SSL_write errors */
+    int ssl_err = SSL_get_error(conn->ssl, ret);
+    switch (ssl_err) {
+    case SSL_ERROR_WANT_WRITE:
+        /* Need to wait for socket writable */
+        if (uring) {
+            io_uring_async_write(uring, conn, buf, len);
+        }
+        return 0;  /* Continue in current state */
+
+    case SSL_ERROR_WANT_READ:
+        /* Need to receive pending data (internal TLS state) */
+        if (uring) {
+            io_uring_async_read(uring, conn, (char *)buf, 1);
+        }
+        return 0;  /* Continue in current state */
+
+    case SSL_ERROR_NONE:
+        /* Connection closed cleanly */
+        log_msg(LGG_DEBUG, "TLS write: connection closed (fd %d)", conn->fd);
+        return -1;
+
+    case SSL_ERROR_SSL:
+    case SSL_ERROR_SYSCALL:
+    default:
+        log_msg(LGG_ERR, "TLS write error (fd %d): %s",
+                conn->fd, ERR_error_string(ERR_get_error(), NULL));
+        return -1;
+    }
 }

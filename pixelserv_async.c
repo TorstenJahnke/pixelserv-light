@@ -170,41 +170,82 @@ static int handle_read_completion(io_uring_wrapper_t *uring, async_connection_t 
         return -1;
     }
 
-    int bytes_read = result;
-
-    if (http_request_append_data(&conn->http, conn->http.request_buf, bytes_read) < 0) {
-        log_msg(LGG_WARNING, "HTTP request buffer overflow");
-        STAT_INC(ers);
-        conn_state_transition(conn, CONN_STATE_ERROR);
-        io_uring_async_close(uring, conn);
-        return -1;
+    /* Handle TLS handshake first (before any HTTP data) */
+    if (conn->state == CONN_STATE_TLS_HANDSHAKE) {
+        STAT_INC(slh);
+        int tls_ret = tls_accept_async(ssl_ctx, conn, uring);
+        if (tls_ret > 0) {
+            /* Handshake complete, transition to HTTP */
+            conn_state_transition(conn, CONN_STATE_HTTP_REQUEST_READ);
+            /* Continue to HTTP processing below */
+        } else if (tls_ret == 0) {
+            /* Still need more I/O, stay in TLS_HANDSHAKE */
+            return 0;
+        } else {
+            /* Error during handshake */
+            log_msg(LGG_WARNING, "TLS handshake failed");
+            conn_state_transition(conn, CONN_STATE_ERROR);
+            io_uring_async_close(uring, conn);
+            return -1;
+        }
     }
 
-    switch (conn->state) {
-        case CONN_STATE_TLS_HANDSHAKE:
-            STAT_INC(slh);
-            conn_state_transition(conn, CONN_STATE_HTTP_REQUEST_READ);
-            break;
+    /* Handle HTTP request reading */
+    if (conn->state == CONN_STATE_HTTP_REQUEST_READ) {
+        int bytes_read = result;
 
-        case CONN_STATE_HTTP_REQUEST_READ:
-            if (http_request_is_complete(&conn->http)) {
-                http_parse_request(&conn->http);
-                http_generate_response(&conn->http);
-                conn_state_transition(conn, CONN_STATE_HTTP_RESPONSE_WRITE);
-                io_uring_async_write(uring, conn, conn->http.response_buf, conn->http.response_len);
+        if (conn->is_https) {
+            /* For HTTPS, use TLS read */
+            bytes_read = tls_read_async(conn, conn->http.request_buf + conn->http.request_len,
+                                       HTTP_BUFFER_SIZE - conn->http.request_len, uring);
+            if (bytes_read < 0) {
+                log_msg(LGG_WARNING, "TLS read error");
+                conn_state_transition(conn, CONN_STATE_ERROR);
+                io_uring_async_close(uring, conn);
+                return -1;
+            } else if (bytes_read == 0) {
+                /* Need more I/O */
                 return 0;
             }
+        }
+
+        if (http_request_append_data(&conn->http, conn->http.request_buf + conn->http.request_len, bytes_read) < 0) {
+            log_msg(LGG_WARNING, "HTTP request buffer overflow");
+            STAT_INC(ers);
+            conn_state_transition(conn, CONN_STATE_ERROR);
+            io_uring_async_close(uring, conn);
+            return -1;
+        }
+
+        if (http_request_is_complete(&conn->http)) {
+            http_parse_request(&conn->http);
+            http_generate_response(&conn->http);
+            conn_state_transition(conn, CONN_STATE_HTTP_RESPONSE_WRITE);
+
+            /* Use TLS or plain write depending on connection type */
+            if (conn->is_https) {
+                tls_write_async(conn, conn->http.response_buf, conn->http.response_len, uring);
+            } else {
+                io_uring_async_write(uring, conn, conn->http.response_buf, conn->http.response_len);
+            }
+            return 0;
+        }
+
+        /* More data needed */
+        if (conn->is_https) {
+            tls_read_async(conn, conn->http.request_buf + conn->http.request_len,
+                          HTTP_BUFFER_SIZE - conn->http.request_len, uring);
+        } else {
             io_uring_async_read(uring, conn,
                     conn->http.request_buf + conn->http.request_len,
                     HTTP_BUFFER_SIZE - conn->http.request_len);
-            break;
-
-        default:
-            log_msg(LGG_WARNING, "Unexpected read in state %s", conn_state_name(conn->state));
-            conn_state_transition(conn, CONN_STATE_ERROR);
+        }
+        return 0;
     }
 
-    return 0;
+    log_msg(LGG_WARNING, "Unexpected read in state %s", conn_state_name(conn->state));
+    conn_state_transition(conn, CONN_STATE_ERROR);
+    return -1;
 }
 
 static int handle_write_completion(io_uring_wrapper_t *uring, async_connection_t *conn, int result) {
@@ -215,6 +256,38 @@ static int handle_write_completion(io_uring_wrapper_t *uring, async_connection_t
         return -1;
     }
 
+    /* For HTTPS, retry TLS write; for HTTP, update sent counter */
+    if (conn->is_https && conn->state == CONN_STATE_HTTP_RESPONSE_WRITE) {
+        /* After I/O completion, retry TLS write */
+        int tls_ret = tls_write_async(conn,
+                                      conn->http.response_buf + conn->http.response_sent,
+                                      conn->http.response_len - conn->http.response_sent,
+                                      uring);
+        if (tls_ret > 0) {
+            conn->http.response_sent += tls_ret;
+            if (conn->http.response_sent < conn->http.response_len) {
+                /* More to send */
+                tls_write_async(conn,
+                               conn->http.response_buf + conn->http.response_sent,
+                               conn->http.response_len - conn->http.response_sent,
+                               uring);
+            } else {
+                /* Done sending */
+                STAT_INC(gif);
+                conn_state_transition(conn, CONN_STATE_CLOSING);
+                io_uring_async_close(uring, conn);
+            }
+        } else if (tls_ret < 0) {
+            /* Error */
+            log_msg(LGG_WARNING, "TLS write error");
+            conn_state_transition(conn, CONN_STATE_ERROR);
+            io_uring_async_close(uring, conn);
+        }
+        /* tls_ret == 0: Need more I/O, queued by tls_write_async() */
+        return 0;
+    }
+
+    /* Plain HTTP: simple write tracking */
     conn->http.response_sent += result;
 
     if (conn->http.response_sent < conn->http.response_len) {
