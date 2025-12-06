@@ -284,27 +284,48 @@ void http_parse_request(http_state_t *http) {
 }
 
 /**
- * Generate HTTP response
+ * Generate simple GIF response
  */
 void http_generate_response(http_state_t *http) {
     if (!http) return;
 
-    /* Generate a simple response (pixelserv default: GIF pixel) */
-    const char *response =
+    /* Minimal GIF response - single pixel */
+    static const unsigned char gif_pixel[] = {
+        'G', 'I', 'F', '8', '9', 'a',  /* Signature */
+        0x01, 0x00, 0x01, 0x00,        /* Width, Height */
+        0x80, 0x00, 0x00,              /* Packed fields, bgcolor, aspect ratio */
+        0x01, 0x01, 0x01,              /* Color table (1 color: black) */
+        0x00, 0x00, 0x00,
+        0x21, 0xf9, 0x04, 0x01,        /* Graphics Control Extension */
+        0x00, 0x00, 0x00, 0x00,
+        0x2c, 0x00, 0x00, 0x00, 0x00,  /* Image descriptor */
+        0x01, 0x00, 0x01, 0x00, 0x00,
+        0x02, 0x01, 0x44, 0x00, 0x3b   /* Image data + trailer */
+    };
+
+    const char *http_header =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: image/gif\r\n"
         "Content-Length: 42\r\n"
-        "Connection: keep-alive\r\n"
-        "\r\n"
-        "GIF89a\001\0\001\0\x80\0\0\001\001\001\0\0\0!\xf9\004\001\0\0\0\0,\0\0\0\0\001\0\001\0\0\002\001D\0;";
+        "Connection: close\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+        "\r\n";
 
-    size_t resp_len = strlen(response);
-    if (resp_len > http->request_capacity) {
-        log_msg(LGG_ERR, "Response buffer too small");
+    size_t header_len = strlen(http_header);
+    size_t gif_len = sizeof(gif_pixel);
+
+    if (header_len + gif_len > http->request_capacity) {
+        log_msg(LGG_ERR, "Response buffer too small: %zu + %zu > %zu",
+                header_len, gif_len, http->request_capacity);
         return;
     }
 
-    memcpy(http->response_buf, response, resp_len);
-    http->response_len = resp_len;
+    /* Copy HTTP header */
+    memcpy(http->response_buf, http_header, header_len);
+
+    /* Copy GIF binary */
+    memcpy(http->response_buf + header_len, gif_pixel, gif_len);
+
+    http->response_len = header_len + gif_len;
     http->response_sent = 0;
 }
