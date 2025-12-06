@@ -1,6 +1,5 @@
 #include "async_connection.h"
 #include "logger.h"
-#include "socket_handler.h"
 #include "util.h"
 #include <stdlib.h>
 #include <string.h>

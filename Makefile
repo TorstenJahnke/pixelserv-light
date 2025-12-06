@@ -129,7 +129,7 @@ endif
 # Source Files
 # =============================================================================
 
-SRCS := pixelserv.c socket_handler.c certs.c logger.c util.c eventloop.c async_connection.c io_uring_async.c
+SRCS := pixelserv_async.c certs.c logger.c util.c async_connection.c io_uring_async.c
 OBJS := $(SRCS:.c=.o)
 
 # Build directory for sanitizer builds
@@ -580,9 +580,9 @@ help:
 # Dependencies
 # =============================================================================
 
-pixelserv.o: pixelserv.c util.h certs.h socket_handler.h logger.h eventloop.h compat.h
-socket_handler.o: socket_handler.c util.h certs.h socket_handler.h logger.h compat.h
+pixelserv_async.o: pixelserv_async.c async_connection.h io_uring_async.h util.h certs.h logger.h compat.h
+async_connection.o: async_connection.c async_connection.h util.h logger.h
+io_uring_async.o: io_uring_async.c io_uring_async.h logger.h compat.h
 certs.o: certs.c certs.h util.h logger.h compat.h
 logger.o: logger.c logger.h
 util.o: util.c util.h compat.h
-eventloop.o: eventloop.c eventloop.h compat.h
