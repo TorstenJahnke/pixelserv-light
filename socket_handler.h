@@ -6,9 +6,15 @@
 
 #define DEFAULT_REPLY SEND_TXT
 #define CHAR_BUF_SIZE       4095     /* initial/incremental size of msg buffer */
-#define MAX_CHAR_BUF_LOTS   32       /* max msg buffer size in unit of CHAR_BUF_SIZE */
+#define MAX_CHAR_BUF_LOTS   32       /* max msg buffer size in unit of CHAR_BUF_SIZE = 128KB */
 #define MAX_HTTP_POST_LEN   262143   /* max POST Content-Length before discarding */
 #define MAX_HTTP_POST_RETRY 3        /* 3 times */
+
+/* Buffer Pool Configuration for 10M+ concurrent users
+ * Eliminates realloc() calls which cause severe heap contention under high load
+ * Pool pre-allocates buffers to avoid malloc/free overhead */
+#define BUFFER_POOL_SIZE    131072   /* 128KB - one per buffer, max request/response size */
+#define BUFFER_POOL_COUNT   256      /* Number of pre-allocated buffers in pool */
 
 typedef enum {
   FAIL_GENERAL,

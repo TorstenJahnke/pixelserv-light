@@ -1499,8 +1499,8 @@ static inline uint64_t cert_index_count(void) {
  * - Scales to millions of concurrent users
  * ============================================================================= */
 
-#define CERTGEN_QUEUE_SIZE 8192   /* Must be power of 2 - handles burst of 8K requests */
-#define CERTGEN_POOL_SIZE 16      /* Number of worker threads - adjust based on CPU cores */
+#define CERTGEN_QUEUE_SIZE 65536  /* Must be power of 2 - 65K queue for high-concurrency (8-10M users) */
+#define CERTGEN_POOL_SIZE 64      /* Number of worker threads - increased for 10M+ scale */
 
 typedef struct {
     char domain[PIXELSERV_MAX_SERVER_NAME + 1];
