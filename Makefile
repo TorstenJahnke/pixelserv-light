@@ -1,9 +1,9 @@
 # =============================================================================
-# pixelserv-tls Makefile
+# tlsgate Makefile
 # =============================================================================
 #
 # Targets:
-#   all          - Build pixelserv-tls binary
+#   all          - Build tlsgate binary
 #   clean        - Remove build artifacts
 #   install      - Install binary to PREFIX
 #
@@ -46,7 +46,7 @@
 # =============================================================================
 
 # Binary name
-PROGNAME := pixelserv-tls
+PROGNAME := tlsgate
 
 # Version
 VERSION ?= 2.5.6
@@ -129,7 +129,7 @@ endif
 # Source Files
 # =============================================================================
 
-SRCS := pixelserv_async.c certs.c logger.c util.c async_connection.c io_uring_async.c
+SRCS := tlsgate_async.c certs.c logger.c util.c async_connection.c io_uring_async.c
 OBJS := $(SRCS:.c=.o)
 
 # Build directory for sanitizer builds
@@ -482,15 +482,15 @@ install: $(PROGNAME)
 	@echo "Installing to $(BINDIR)..."
 	@mkdir -p $(DESTDIR)$(BINDIR)
 	@install -m 755 $(PROGNAME) $(DESTDIR)$(BINDIR)/
-	@if [ -f pixelserv-tls.1 ]; then \
+	@if [ -f tlsgate.1 ]; then \
 		mkdir -p $(DESTDIR)$(MANDIR); \
-		install -m 644 pixelserv-tls.1 $(DESTDIR)$(MANDIR)/; \
+		install -m 644 tlsgate.1 $(DESTDIR)$(MANDIR)/; \
 	fi
 	@echo "Installed $(PROGNAME) to $(BINDIR)"
 
 uninstall:
 	@rm -f $(DESTDIR)$(BINDIR)/$(PROGNAME)
-	@rm -f $(DESTDIR)$(MANDIR)/pixelserv-tls.1
+	@rm -f $(DESTDIR)$(MANDIR)/tlsgate.1
 	@echo "Uninstalled $(PROGNAME)"
 
 # =============================================================================
@@ -512,7 +512,7 @@ distclean: clean clean-test-ca
 
 info:
 	@echo ""
-	@echo "pixelserv-tls $(VERSION) Build Configuration"
+	@echo "tlsgate $(VERSION) Build Configuration"
 	@echo "============================================"
 	@echo ""
 	@echo "Compiler:      $(CC)"
@@ -536,7 +536,7 @@ endif
 
 help:
 	@echo ""
-	@echo "pixelserv-tls $(VERSION) - Build targets:"
+	@echo "tlsgate $(VERSION) - Build targets:"
 	@echo ""
 	@echo "  Building:"
 	@echo "    make              - Build with default settings"
@@ -580,7 +580,7 @@ help:
 # Dependencies
 # =============================================================================
 
-pixelserv_async.o: pixelserv_async.c async_connection.h io_uring_async.h util.h certs.h logger.h compat.h
+tlsgate_async.o: tlsgate_async.c async_connection.h io_uring_async.h util.h certs.h logger.h compat.h
 async_connection.o: async_connection.c async_connection.h util.h logger.h
 io_uring_async.o: io_uring_async.c io_uring_async.h logger.h compat.h
 certs.o: certs.c certs.h util.h logger.h compat.h
