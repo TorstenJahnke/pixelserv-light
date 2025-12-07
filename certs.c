@@ -772,7 +772,9 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
         goto free_all;
     ASN1_INTEGER_set(X509_get_serialNumber(x509),rand());
     X509_set_version(x509, 2); // X509 v3
-    X509_gmtime_adj(X509_get_notBefore(x509), 0);
+    /* Random backdated "Not Before" between 1-3 weeks ago (avoids obvious just-created certs) */
+    long backdate_secs = -(604800 + (rand() % 1209600)); /* 1 week + random 0-2 weeks */
+    X509_gmtime_adj(X509_get_notBefore(x509), backdate_secs);
     X509_gmtime_adj(X509_get_notAfter(x509), 3600*24*(long)cert_validity_days); // cert validity from config
     X509_set_issuer_name(x509, issuer);
     X509_NAME *name = X509_get_subject_name(x509);
