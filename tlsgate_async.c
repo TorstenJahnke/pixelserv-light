@@ -532,6 +532,10 @@ static int initialize(void) {
 
     log_msg(LGG_NOTICE, "TLS initialized: cipher list set, SNI callback registered");
 
+    /* Initialize async certificate generation pool (lock-free, non-blocking)
+     * This handles on-the-fly cert generation without blocking worker threads */
+    certgen_pool_init(&cert_tlstor);
+
     /* Determine number of worker threads (one per CPU core) */
     num_workers = get_nprocs();
     if (num_workers <= 0) num_workers = 1;
@@ -583,6 +587,9 @@ static void cleanup(void) {
 
     /* Save cached certificates to disk for faster startup next time */
     sslctx_tbl_save(pem_dir);
+    /* Shutdown certificate generation pool first */
+    certgen_pool_shutdown();
+
     sslctx_tbl_cleanup();
 
     if (ssl_ctx) {

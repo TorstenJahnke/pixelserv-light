@@ -1515,8 +1515,8 @@ static _Atomic int certgen_shutdown = 0;
 static pthread_t certgen_workers[CERTGEN_POOL_SIZE];
 static cert_tlstor_t *certgen_ctx = NULL;
 
-/* Enqueue work item - called by reader thread */
-static int certgen_enqueue(const char *domain) {
+/* Enqueue work item - called from SNI callback (lock-free, non-blocking) */
+int certgen_enqueue(const char *domain) {
     uint32_t head = atomic_load_explicit(&certgen_queue_head, memory_order_relaxed);
     uint32_t next_head = (head + 1) & (CERTGEN_QUEUE_SIZE - 1);
     uint32_t tail = atomic_load_explicit(&certgen_queue_tail, memory_order_acquire);
@@ -1593,8 +1593,8 @@ static void *certgen_worker(void *arg) {
     return NULL;
 }
 
-/* Initialize thread pool */
-static void certgen_pool_init(cert_tlstor_t *ct) {
+/* Initialize thread pool - call once at startup */
+void certgen_pool_init(cert_tlstor_t *ct) {
     certgen_ctx = ct;
     atomic_store(&certgen_shutdown, 0);
     atomic_store(&certgen_queue_head, 0);
@@ -1841,25 +1841,19 @@ static int tls_servername_cb(SSL *ssl, int *ad, void *arg) {
 
 submit_missing_cert:
 
-        if ((fd = open(PIXEL_CERT_PIPE, O_WRONLY | O_NONBLOCK)) < 0) {
-            /* Pipe not available - generate certificate synchronously if we have issuer/privkey */
-            if (cbarg->issuer && cbarg->privkey) {
-                char pem_file_copy[PIXELSERV_MAX_SERVER_NAME + 1];
-                strncpy(pem_file_copy, pem_file, sizeof(pem_file_copy) - 1);
-                pem_file_copy[sizeof(pem_file_copy) - 1] = '\0';
+        /* Try lock-free async queue first (non-blocking, O(1)) */
+        if (certgen_enqueue(pem_file) == 0) {
+            /* Successfully queued - cert will be generated async by worker pool.
+             * Return error so client retries; cert should be ready by then. */
 #ifdef DEBUG
-                log_msg(LGG_NOTICE, "Generating certificate synchronously for %s", pem_file_copy);
+            log_msg(LGG_DEBUG, "Queued async cert generation for %s", pem_file);
 #endif
-                generate_cert(pem_file_copy, cbarg->tls_pem, cbarg->issuer, cbarg->privkey);
-                /* Re-check if file was created */
-                if (stat(full_pem_path, &st) == 0) {
-                    goto load_cert_from_disk;
-                }
-            }
-#ifdef DEBUG
-            log_msg(LGG_ERR, "%s: failed to open pipe and no issuer/key for sync gen", __FUNCTION__);
-#endif
-        } else {
+            rv = CB_ERR;
+            goto quit_cb;
+        }
+
+        /* Queue full - try legacy FIFO pipe as fallback */
+        if ((fd = open(PIXEL_CERT_PIPE, O_WRONLY | O_NONBLOCK)) >= 0) {
             size_t i = 0;
             for(i=0; i< strlen(pem_file); i++)
                 *(full_pem_path + i) = *(pem_file + i);
@@ -1873,6 +1867,11 @@ submit_missing_cert:
             }
             close(fd);
         }
+#ifdef DEBUG
+        else {
+            log_msg(LGG_WARNING, "%s: queue full and pipe unavailable for %s", __FUNCTION__, pem_file);
+        }
+#endif
 
         rv = CB_ERR;
         goto quit_cb;
