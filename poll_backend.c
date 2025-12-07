@@ -183,8 +183,9 @@ int event_loop_wait(event_loop_t *loop, int timeout_ms, event_completion_handler
             case IO_OP_ACCEPT: {
                 if (loop->fds[i].revents & POLLIN) {
                     result = accept(loop->ops[i].fd, NULL, NULL);
+                    if (result < 0) result = -errno;  /* Return -errno for error handling */
                 } else {
-                    result = -1;
+                    result = -EAGAIN;  /* No data ready yet */
                 }
                 break;
             }

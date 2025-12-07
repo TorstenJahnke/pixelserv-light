@@ -135,8 +135,16 @@ static void setup_signal_handlers(void) {
 
 static int handle_accept_completion(event_loop_t *uring, async_connection_t *conn, int result) {
     if (result < 0) {
-        log_msg(LGG_DEBUG, "accept() error: %d", result);
-        conn_pool_release(conn_pool, conn);
+        /* EAGAIN/EWOULDBLOCK is normal with SO_REUSEPORT when another worker got the connection
+         * Don't log or treat as error - just re-queue the accept */
+        if (result == -EAGAIN || result == -EWOULDBLOCK || result == -1) {
+            /* Re-submit accept to continue listening */
+            event_loop_accept(uring, conn->fd, conn);
+            return 0;
+        }
+        log_msg(LGG_WARNING, "accept() failed: %d", result);
+        /* For fatal errors, still re-submit to continue accepting */
+        event_loop_accept(uring, conn->fd, conn);
         return -1;
     }
 
