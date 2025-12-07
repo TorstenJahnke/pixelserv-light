@@ -38,6 +38,7 @@ static pthread_mutex_t *legacy_openssl_locks;
 #endif
 
 static SSL_CTX *g_sslctx;
+static tlsext_cb_arg_struct g_sslctx_cb_arg;
 
 /* =============================================================================
  * LOCK-FREE HASH TABLE FOR SSL CONTEXT CACHE
@@ -1840,9 +1841,23 @@ static int tls_servername_cb(SSL *ssl, int *ad, void *arg) {
 
 submit_missing_cert:
 
-        if ((fd = open(PIXEL_CERT_PIPE, O_WRONLY)) < 0) {
+        if ((fd = open(PIXEL_CERT_PIPE, O_WRONLY | O_NONBLOCK)) < 0) {
+            /* Pipe not available - generate certificate synchronously if we have issuer/privkey */
+            if (cbarg->issuer && cbarg->privkey) {
+                char pem_file_copy[PIXELSERV_MAX_SERVER_NAME + 1];
+                strncpy(pem_file_copy, pem_file, sizeof(pem_file_copy) - 1);
+                pem_file_copy[sizeof(pem_file_copy) - 1] = '\0';
 #ifdef DEBUG
-            log_msg(LGG_ERR, "%s: failed to open pipe: %s", __FUNCTION__, strerror(errno));
+                log_msg(LGG_NOTICE, "Generating certificate synchronously for %s", pem_file_copy);
+#endif
+                generate_cert(pem_file_copy, cbarg->tls_pem, cbarg->issuer, cbarg->privkey);
+                /* Re-check if file was created */
+                if (stat(full_pem_path, &st) == 0) {
+                    goto load_cert_from_disk;
+                }
+            }
+#ifdef DEBUG
+            log_msg(LGG_ERR, "%s: failed to open pipe and no issuer/key for sync gen", __FUNCTION__);
 #endif
         } else {
             size_t i = 0;
@@ -1862,6 +1877,8 @@ submit_missing_cert:
         rv = CB_ERR;
         goto quit_cb;
     }
+
+load_cert_from_disk:
 
     /* Load cert from disk - lock-free, multiple threads can do this */
     SSL_CTX *sslctx = create_child_sslctx(full_pem_path, cbarg->cachain);
@@ -1980,7 +1997,7 @@ static SSL_CTX* create_child_sslctx(const char* full_pem_path, const STACK_OF(X5
     return sslctx;
 }
 
-SSL_CTX* create_default_sslctx(const char *pem_dir)
+SSL_CTX* create_default_sslctx(const char *pem_dir, X509_NAME *issuer, EVP_PKEY *privkey)
 {
     if (g_sslctx)
         return g_sslctx;
@@ -2004,9 +2021,20 @@ SSL_CTX* create_default_sslctx(const char *pem_dir)
         if (SSL_CTX_set_cipher_list(g_sslctx, PIXELSERV_CIPHER_LIST_ACTIVE) <= 0)
             log_msg(LGG_DEBUG, "cipher_list cannot be set");
     }
+    /* Initialize global callback argument with pem_dir and cert generation params */
+    memset(&g_sslctx_cb_arg, 0, sizeof(g_sslctx_cb_arg));
+    g_sslctx_cb_arg.tls_pem = pem_dir;
+    g_sslctx_cb_arg.issuer = issuer;
+    g_sslctx_cb_arg.privkey = privkey;
+
 #ifndef TLS1_3_VERSION
+    /* TLS 1.2 and earlier: use servername callback */
     SSL_CTX_set_tlsext_servername_callback(g_sslctx, tls_servername_cb);
+    SSL_CTX_set_tlsext_servername_arg(g_sslctx, &g_sslctx_cb_arg);
 #else
+    /* TLS 1.3: use client hello callback for SNI handling
+     * This callback handles SNI for all TLS versions when TLS 1.3 is compiled in */
+    SSL_CTX_set_client_hello_cb(g_sslctx, tls_clienthello_cb, &g_sslctx_cb_arg);
     SSL_CTX_set_max_early_data(g_sslctx, PIXEL_TLS_EARLYDATA_SIZE);
     /* Set TLS 1.3 ciphers with SM4 support */
     if (SSL_CTX_set_ciphersuites(g_sslctx, PIXELSERV_TLSV1_3_CIPHERS_FULL) <= 0) {
@@ -2014,6 +2042,7 @@ SSL_CTX* create_default_sslctx(const char *pem_dir)
         SSL_CTX_set_ciphersuites(g_sslctx, PIXELSERV_TLSV1_3_CIPHERS);
     }
 #endif
+    log_msg(LGG_NOTICE, "SSL context created with SNI callback (pem_dir=%s)", pem_dir);
     return g_sslctx;
 }
 
