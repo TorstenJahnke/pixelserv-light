@@ -815,7 +815,7 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
     // -- save cert
     if(pem_fn[0] == '*')
         pem_fn[0] = '_';
-    snprintf(fname, PIXELSERV_MAX_PATH, "%s/%s", pem_dir, pem_fn);
+    snprintf(fname, PIXELSERV_MAX_PATH, "%s/%s.pem", pem_dir, pem_fn);
     FILE *fp = fopen(fname, "wb");
     if(fp == NULL) {
         log_msg(LGG_ERR, "%s: failed to open file for write: %s", __FUNCTION__, fname);
@@ -1798,6 +1798,9 @@ static int tls_servername_cb(SSL *ssl, int *ad, void *arg) {
         strncat(full_pem_path, strchr(srv_name, '.'), PIXELSERV_MAX_PATH - len);
         len += strlen(strchr(srv_name, '.'));
     }
+    /* Append .pem extension for file operations */
+    strncat(full_pem_path, ".pem", PIXELSERV_MAX_PATH - len);
+    len += 4;
 #ifdef DEBUG
     printf("PEM filename: %s\n",full_pem_path);
 #endif
@@ -1833,7 +1836,6 @@ static int tls_servername_cb(SSL *ssl, int *ad, void *arg) {
 
     struct stat st;
     if (stat(full_pem_path, &st) != 0) {
-        int fd;
         cbarg->status = SSL_MISS;
 #ifdef DEBUG
         log_msg(LGG_WARNING, "%s %s missing", srv_name, pem_file);
@@ -1841,38 +1843,25 @@ static int tls_servername_cb(SSL *ssl, int *ad, void *arg) {
 
 submit_missing_cert:
 
-        /* Try lock-free async queue first (non-blocking, O(1)) */
-        if (certgen_enqueue(pem_file) == 0) {
-            /* Successfully queued - cert will be generated async by worker pool.
-             * Return error so client retries; cert should be ready by then. */
+        /* Generate certificate synchronously - blocks but no SSL error for client
+         * This only happens once per domain, subsequent requests use cache */
+        if (cbarg->issuer && cbarg->privkey) {
+            char pem_file_copy[PIXELSERV_MAX_SERVER_NAME + 1];
+            strncpy(pem_file_copy, pem_file, sizeof(pem_file_copy) - 1);
+            pem_file_copy[sizeof(pem_file_copy) - 1] = '\0';
 #ifdef DEBUG
-            log_msg(LGG_DEBUG, "Queued async cert generation for %s", pem_file);
+            log_msg(LGG_NOTICE, "Generating certificate for %s", pem_file_copy);
 #endif
-            rv = CB_ERR;
-            goto quit_cb;
-        }
+            generate_cert(pem_file_copy, cbarg->tls_pem, cbarg->issuer, cbarg->privkey);
 
-        /* Queue full - try legacy FIFO pipe as fallback */
-        if ((fd = open(PIXEL_CERT_PIPE, O_WRONLY | O_NONBLOCK)) >= 0) {
-            size_t i = 0;
-            for(i=0; i< strlen(pem_file); i++)
-                *(full_pem_path + i) = *(pem_file + i);
-            *(full_pem_path + i) = ':';
-            *(full_pem_path + i + 1) = '\0';
-
-            if (write(fd, full_pem_path, strlen(full_pem_path)) < 0) {
-#ifdef DEBUG
-                log_msg(LGG_ERR, "%s: failed to write pipe: %s", __FUNCTION__, strerror(errno));
-#endif
+            /* Cert generated - now load it */
+            if (stat(full_pem_path, &st) == 0) {
+                goto load_cert_from_disk;
             }
-            close(fd);
         }
 #ifdef DEBUG
-        else {
-            log_msg(LGG_WARNING, "%s: queue full and pipe unavailable for %s", __FUNCTION__, pem_file);
-        }
+        log_msg(LGG_ERR, "%s: failed to generate cert for %s", __FUNCTION__, pem_file);
 #endif
-
         rv = CB_ERR;
         goto quit_cb;
     }
