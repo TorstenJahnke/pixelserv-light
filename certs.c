@@ -613,6 +613,123 @@ void ssl_free_locks()
     /* OpenSSL >= 1.1.0: nothing to do */
 }
 
+/* Load RSA key from pre-computed primes (much faster than generating new primes)
+ * Primes are stored in pem_dir/primes/<bits>/p.prime and q.prime
+ * Returns EVP_PKEY on success, NULL if primes not available (caller should fall back) */
+static EVP_PKEY *rsa_from_primes(const char *pem_dir, int bits) {
+    char p_path[PIXELSERV_MAX_PATH], q_path[PIXELSERV_MAX_PATH];
+    FILE *fp;
+    BIGNUM *p = NULL, *q = NULL, *n = NULL, *d = NULL, *e = NULL;
+    BIGNUM *dmp1 = NULL, *dmq1 = NULL, *iqmp = NULL;
+    BIGNUM *p1 = NULL, *q1 = NULL, *phi = NULL;
+    RSA *rsa = NULL;
+    EVP_PKEY *pkey = NULL;
+    BN_CTX *ctx = NULL;
+
+    snprintf(p_path, sizeof(p_path), "%s/primes/%d/p.prime", pem_dir, bits);
+    snprintf(q_path, sizeof(q_path), "%s/primes/%d/q.prime", pem_dir, bits);
+
+    /* Load p */
+    fp = fopen(p_path, "r");
+    if (!fp) return NULL;
+    if (BN_hex2bn(&p, NULL) == 0) p = BN_new();
+    char hex_buf[2048];
+    if (fgets(hex_buf, sizeof(hex_buf), fp)) {
+        /* Remove newline */
+        char *nl = strchr(hex_buf, '\n');
+        if (nl) *nl = '\0';
+        BN_hex2bn(&p, hex_buf);
+    }
+    fclose(fp);
+    if (!p || BN_is_zero(p)) { BN_free(p); return NULL; }
+
+    /* Load q */
+    fp = fopen(q_path, "r");
+    if (!fp) { BN_free(p); return NULL; }
+    if (fgets(hex_buf, sizeof(hex_buf), fp)) {
+        char *nl = strchr(hex_buf, '\n');
+        if (nl) *nl = '\0';
+        BN_hex2bn(&q, hex_buf);
+    }
+    fclose(fp);
+    if (!q || BN_is_zero(q)) { BN_free(p); BN_free(q); return NULL; }
+
+    /* Compute RSA components from p and q */
+    ctx = BN_CTX_new();
+    n = BN_new();
+    d = BN_new();
+    e = BN_new();
+    p1 = BN_new();
+    q1 = BN_new();
+    phi = BN_new();
+    dmp1 = BN_new();
+    dmq1 = BN_new();
+    iqmp = BN_new();
+
+    if (!ctx || !n || !d || !e || !p1 || !q1 || !phi || !dmp1 || !dmq1 || !iqmp)
+        goto cleanup;
+
+    /* e = 65537 (RSA_F4) */
+    BN_set_word(e, RSA_F4);
+
+    /* n = p * q */
+    BN_mul(n, p, q, ctx);
+
+    /* phi = (p-1) * (q-1) */
+    BN_sub(p1, p, BN_value_one());
+    BN_sub(q1, q, BN_value_one());
+    BN_mul(phi, p1, q1, ctx);
+
+    /* d = e^(-1) mod phi */
+    if (!BN_mod_inverse(d, e, phi, ctx))
+        goto cleanup;
+
+    /* CRT parameters for faster decryption */
+    /* dmp1 = d mod (p-1) */
+    BN_mod(dmp1, d, p1, ctx);
+    /* dmq1 = d mod (q-1) */
+    BN_mod(dmq1, d, q1, ctx);
+    /* iqmp = q^(-1) mod p */
+    BN_mod_inverse(iqmp, q, p, ctx);
+
+    /* Create RSA key */
+    rsa = RSA_new();
+    if (!rsa) goto cleanup;
+
+    /* RSA_set0_* functions take ownership of BIGNUMs on success */
+    if (!RSA_set0_key(rsa, BN_dup(n), BN_dup(e), BN_dup(d))) {
+        RSA_free(rsa);
+        rsa = NULL;
+        goto cleanup;
+    }
+    if (!RSA_set0_factors(rsa, BN_dup(p), BN_dup(q))) {
+        RSA_free(rsa);
+        rsa = NULL;
+        goto cleanup;
+    }
+    if (!RSA_set0_crt_params(rsa, BN_dup(dmp1), BN_dup(dmq1), BN_dup(iqmp))) {
+        RSA_free(rsa);
+        rsa = NULL;
+        goto cleanup;
+    }
+
+    /* Wrap in EVP_PKEY */
+    pkey = EVP_PKEY_new();
+    if (pkey) {
+        EVP_PKEY_assign_RSA(pkey, rsa);
+        rsa = NULL; /* pkey owns it now */
+        log_msg(LGG_DEBUG, "RSA-%d key loaded from pre-computed primes", bits);
+    }
+
+cleanup:
+    BN_free(p); BN_free(q); BN_free(n); BN_free(d); BN_free(e);
+    BN_free(p1); BN_free(q1); BN_free(phi);
+    BN_free(dmp1); BN_free(dmq1); BN_free(iqmp);
+    BN_CTX_free(ctx);
+    if (rsa) RSA_free(rsa);
+    return pkey;
+}
+
 static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, EVP_PKEY *privkey)
 {
     char fname[PIXELSERV_MAX_PATH];
@@ -638,10 +755,11 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
 
     switch (cert_key_type) {
     case 0: // RSA 2048
+        key = rsa_from_primes(pem_dir, 2048);
+        if (!key) {
 #if OPENSSL_VERSION_MAJOR >= 3
-        key = EVP_RSA_gen(2048);
+            key = EVP_RSA_gen(2048);
 #else
-        {
             RSA *rsa = RSA_new();
             if (RSA_generate_key_ex(rsa, 2048, e, NULL) < 0) {
                 RSA_free(rsa);
@@ -649,14 +767,15 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
             }
             key = EVP_PKEY_new();
             EVP_PKEY_assign_RSA(key, rsa);
-        }
 #endif
+        }
         break;
     case 2: // RSA 4096
+        key = rsa_from_primes(pem_dir, 4096);
+        if (!key) {
 #if OPENSSL_VERSION_MAJOR >= 3
-        key = EVP_RSA_gen(4096);
+            key = EVP_RSA_gen(4096);
 #else
-        {
             RSA *rsa = RSA_new();
             if (RSA_generate_key_ex(rsa, 4096, e, NULL) < 0) {
                 RSA_free(rsa);
@@ -664,14 +783,15 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
             }
             key = EVP_PKEY_new();
             EVP_PKEY_assign_RSA(key, rsa);
-        }
 #endif
+        }
         break;
     case 3: // RSA 8192
+        key = rsa_from_primes(pem_dir, 8192);
+        if (!key) {
 #if OPENSSL_VERSION_MAJOR >= 3
-        key = EVP_RSA_gen(8192);
+            key = EVP_RSA_gen(8192);
 #else
-        {
             RSA *rsa = RSA_new();
             if (RSA_generate_key_ex(rsa, 8192, e, NULL) < 0) {
                 RSA_free(rsa);
@@ -679,14 +799,15 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
             }
             key = EVP_PKEY_new();
             EVP_PKEY_assign_RSA(key, rsa);
-        }
 #endif
+        }
         break;
     case 4: // RSA 16384
+        key = rsa_from_primes(pem_dir, 16384);
+        if (!key) {
 #if OPENSSL_VERSION_MAJOR >= 3
-        key = EVP_RSA_gen(16384);
+            key = EVP_RSA_gen(16384);
 #else
-        {
             RSA *rsa = RSA_new();
             if (RSA_generate_key_ex(rsa, 16384, e, NULL) < 0) {
                 RSA_free(rsa);
@@ -694,8 +815,8 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
             }
             key = EVP_PKEY_new();
             EVP_PKEY_assign_RSA(key, rsa);
-        }
 #endif
+        }
         break;
     case 5: // ECDSA P-256
 #if OPENSSL_VERSION_MAJOR >= 3
@@ -746,10 +867,11 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
 #endif
     case 1: // RSA 3072 (default)
     default:
+        key = rsa_from_primes(pem_dir, 3072);
+        if (!key) {
 #if OPENSSL_VERSION_MAJOR >= 3
-        key = EVP_RSA_gen(3072);
+            key = EVP_RSA_gen(3072);
 #else
-        {
             RSA *rsa = RSA_new();
             if (RSA_generate_key_ex(rsa, 3072, e, NULL) < 0) {
                 RSA_free(rsa);
@@ -757,8 +879,8 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
             }
             key = EVP_PKEY_new();
             EVP_PKEY_assign_RSA(key, rsa);
-        }
 #endif
+        }
         break;
     }
 
