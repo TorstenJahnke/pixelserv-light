@@ -330,6 +330,8 @@ typedef enum {
 typedef struct {
     const char *tls_pem;
     const STACK_OF(X509_INFO) *cachain;
+    X509_NAME *issuer;      /* CA issuer for on-the-fly cert generation */
+    EVP_PKEY *privkey;      /* CA private key for signing */
     char servername[65]; /* max legal domain name 63 chars; INET6_ADDRSTRLEN 46 bytes */
     char server_ip[INET6_ADDRSTRLEN];
     ssl_enum status;
@@ -375,7 +377,7 @@ int sslctx_tbl_get_sess_cnt();
 int sslctx_tbl_get_sess_hit();
 int sslctx_tbl_get_sess_miss();
 int sslctx_tbl_get_sess_purge();
-SSL_CTX * create_default_sslctx(const char *pem_dir);
+SSL_CTX * create_default_sslctx(const char *pem_dir, X509_NAME *issuer, EVP_PKEY *privkey);
 int is_ssl_conn(int fd, char *srv_ip, int srv_ip_len, const int *ssl_ports, int num_ssl_ports);
 void conn_stor_init(int slots);
 void conn_stor_relinq(conn_tlstor_struct *p);

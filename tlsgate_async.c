@@ -80,6 +80,10 @@ static int listen_port_https = 443;
 static int listen_fd_http = -1;
 static int listen_fd_https = -1;
 static SSL_CTX *ssl_ctx = NULL;
+static const char *pem_dir = DEFAULT_PEM_PATH;
+
+/* SSL context hash table size for certificate caching */
+#define SSLCTX_TBL_SIZE 100000
 
 /* Connection management (shared across all threads) */
 static connection_pool_t *conn_pool = NULL;
@@ -154,7 +158,9 @@ static int handle_accept_completion(event_loop_t *uring, async_connection_t *con
 
     if (is_https) {
         conn_state_transition(new_conn, CONN_STATE_TLS_HANDSHAKE);
-        event_loop_read(uring, new_conn, new_conn->http.request_buf, 4096);
+        /* For TLS, use dummy buffer (len=1) to just wait for socket readability
+         * SSL_accept() will do the actual reading */
+        event_loop_read(uring, new_conn, (char *)&new_conn->ssl, 1);
     } else {
         conn_state_transition(new_conn, CONN_STATE_HTTP_REQUEST_READ);
         event_loop_read(uring, new_conn, new_conn->http.request_buf, 4096);
@@ -488,14 +494,35 @@ static int initialize(void) {
         log_msg(LGG_WARNING, "Failed to setup HTTPS listener");
     }
 
-    /* Initialize SSL context */
+    /* Initialize OpenSSL library */
     SSL_library_init();
     SSL_load_error_strings();
-    ssl_ctx = SSL_CTX_new(SSLv23_server_method());
+    OpenSSL_add_all_algorithms();
+
+    /* Initialize certificate storage (loads CA cert and private key) */
+    log_msg(LGG_NOTICE, "Initializing certificate storage from %s", pem_dir);
+    cert_tlstor_init(pem_dir, &cert_tlstor);
+    if (!cert_tlstor.privkey || !cert_tlstor.issuer) {
+        log_msg(LGG_ERR, "Failed to load CA certificate/key from %s", pem_dir);
+        log_msg(LGG_ERR, "Please ensure ca.crt and ca.key exist in %s", pem_dir);
+        return -1;
+    }
+
+    /* Initialize SSL context hash table for certificate caching */
+    sslctx_tbl_init(SSLCTX_TBL_SIZE);
+
+    /* Load pre-cached certificates from disk */
+    sslctx_tbl_load(pem_dir, cert_tlstor.cachain);
+
+    /* Create default SSL context with proper configuration
+     * Pass issuer and privkey for on-the-fly certificate generation */
+    ssl_ctx = create_default_sslctx(pem_dir, cert_tlstor.issuer, cert_tlstor.privkey);
     if (!ssl_ctx) {
         log_msg(LGG_ERR, "Failed to create SSL context");
         return -1;
     }
+
+    log_msg(LGG_NOTICE, "TLS initialized: cipher list set, SNI callback registered");
 
     /* Determine number of worker threads (one per CPU core) */
     num_workers = get_nprocs();
@@ -545,6 +572,10 @@ static void cleanup(void) {
 
     if (listen_fd_http >= 0) close(listen_fd_http);
     if (listen_fd_https >= 0) close(listen_fd_https);
+
+    /* Save cached certificates to disk for faster startup next time */
+    sslctx_tbl_save(pem_dir);
+    sslctx_tbl_cleanup();
 
     if (ssl_ctx) {
         SSL_CTX_free(ssl_ctx);

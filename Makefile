@@ -134,9 +134,17 @@ SRCS := tlsgate_async.c certs.c logger.c util.c async_connection.c
 
 # Platform-specific event loop backend
 ifeq ($(UNAME_S),Linux)
-    SRCS += io_uring_backend.c
-    CFLAGS += -DHAVE_IO_URING
-    $(info Using io_uring backend for Linux)
+    # Check if liburing is available
+    ifneq ($(wildcard /usr/include/liburing.h),)
+        SRCS += io_uring_backend.c
+        CFLAGS += -DHAVE_IO_URING
+        LDLIBS += -luring
+        $(info Using io_uring backend for Linux)
+    else
+        SRCS += poll_backend.c
+        CFLAGS += -DHAVE_POLL_BACKEND
+        $(info Using poll backend for Linux - liburing not available)
+    endif
 else ifeq ($(UNAME_S),FreeBSD)
     SRCS += kqueue_backend.c
     CFLAGS += -DHAVE_KQUEUE
@@ -151,10 +159,11 @@ endif
 
 OBJS := $(SRCS:.c=.o)
 
-# TLSGate (ultra-scale architecture)
+# TLSGate (ultra-scale architecture) - Alternative implementation in src/
+# Use "make tlsgate-alt" to build this version
 TLSGATE_SRCS := src/tlsgate.c src/connection.c src/buffer_pool.c src/worker.c src/response.c
 TLSGATE_OBJS := $(TLSGATE_SRCS:.c=.o)
-TLSGATE_BIN := tlsgate
+TLSGATE_BIN := tlsgate-alt
 
 # Build directory for sanitizer builds
 OBJDIR := build
@@ -256,16 +265,16 @@ debug:
 # TLSGate - Ultra-Scale Architecture (10M+ concurrent connections)
 # =============================================================================
 
-tlsgate: $(TLSGATE_OBJS)
+tlsgate-alt: $(TLSGATE_OBJS)
 	$(CC) $(CFLAGS) -o $(TLSGATE_BIN) $^ $(LDFLAGS)
 	@echo ""
-	@echo "Built $(TLSGATE_BIN) - Ultra-Scale TLS Server"
+	@echo "Built $(TLSGATE_BIN) - Ultra-Scale TLS Server (Alternative)"
 	@echo "  Architecture: Event-driven, lock-free"
 	@echo "  Target: 10M+ concurrent connections"
 	@echo ""
 
-tlsgate-debug:
-	$(MAKE) DEBUG=1 tlsgate
+tlsgate-alt-debug:
+	$(MAKE) DEBUG=1 tlsgate-alt
 
 tlsgate-production: CFLAGS += -O3 -march=native -flto -DNDEBUG
 tlsgate-production: LDFLAGS += -flto

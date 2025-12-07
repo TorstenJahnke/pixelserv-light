@@ -1,14 +1,12 @@
 #include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 #include <syslog.h>
 #include <openssl/ssl.h>
 #include "logger.h"
 
-#ifndef DEBUG
-static logger_level _verb = LGG_ERR;
-#else
+/* Force DEBUG level for troubleshooting */
 static logger_level _verb = LGG_DEBUG;
-#endif
 
 static int ctrl_char(char *buf, size_t len) {
     if (strlen(buf) < len)
@@ -30,8 +28,14 @@ void log_msg(logger_level verb, char *fmt, ...)
 {
     if (verb > _verb)
         return;
-      
+
     va_list args;
+    va_start(args, fmt);
+    /* Also print to stderr for debugging */
+    vfprintf(stderr, fmt, args);
+    fprintf(stderr, "\n");
+    va_end(args);
+
     va_start(args, fmt);
     vsyslog(LOG_CRIT + verb, fmt, args);
     va_end(args);
