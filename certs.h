@@ -383,7 +383,10 @@ void conn_stor_init(int slots);
 void conn_stor_relinq(conn_tlstor_struct *p);
 conn_tlstor_struct* conn_stor_acquire();
 void conn_stor_flush();
+/* Async certificate generation pool (lock-free) */
+void certgen_pool_init(cert_tlstor_t *ct);
 void certgen_pool_shutdown(void);
+int certgen_enqueue(const char *domain);
 #ifdef TLS1_3_VERSION
 int tls_clienthello_cb(SSL *ssl, int *ad, void *arg);
 char* read_tls_early_data(SSL *ssl, int *err);
