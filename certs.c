@@ -22,10 +22,28 @@
 #include <openssl/rsa.h>
 #include <openssl/ec.h>
 #include <openssl/x509v3.h>
+#include <openssl/param_build.h>
+#include <openssl/core_names.h>
 
 #include "certs.h"
 #include "logger.h"
 #include "util.h"
+
+/* Optional UDP index support - enabled at link time */
+#ifdef ENABLE_UDP_INDEX
+#include "include/index_udp.h"
+#include "include/cert_index_sharded.h"
+#define HAS_UDP_INDEX 1
+#else
+#define HAS_UDP_INDEX 0
+#define INDEX_UDP_DEFAULT_PORT 19847
+/* Stub functions when UDP support is not enabled */
+static inline int index_udp_client_init(const char *h, uint16_t p) { (void)h; (void)p; return -1; }
+static inline void index_udp_client_shutdown(void) {}
+static inline int index_udp_client_insert(const char *d, int a, uint32_t c, uint64_t e) {
+    (void)d; (void)a; (void)c; (void)e; return -1;
+}
+#endif
 
 #if defined(__GLIBC__) && !defined(__UCLIBC__)
 #  include <malloc.h>
@@ -616,15 +634,18 @@ void ssl_free_locks()
 
 /* Load RSA key from pre-computed primes (much faster than generating new primes)
  * Primes are stored in pem_dir/primes/<bits>/p.prime and q.prime
- * Returns EVP_PKEY on success, NULL if primes not available (caller should fall back) */
+ * Returns EVP_PKEY on success, NULL if primes not available (caller should fall back)
+ * Uses OpenSSL 3.0+ EVP API exclusively */
 static EVP_PKEY *rsa_from_primes(const char *pem_dir, int bits) {
     char p_path[PIXELSERV_MAX_PATH], q_path[PIXELSERV_MAX_PATH];
     FILE *fp;
     BIGNUM *p = NULL, *q = NULL, *n = NULL, *d = NULL, *e = NULL;
     BIGNUM *dmp1 = NULL, *dmq1 = NULL, *iqmp = NULL;
     BIGNUM *p1 = NULL, *q1 = NULL, *phi = NULL;
-    RSA *rsa = NULL;
     EVP_PKEY *pkey = NULL;
+    EVP_PKEY_CTX *pctx = NULL;
+    OSSL_PARAM_BLD *bld = NULL;
+    OSSL_PARAM *params = NULL;
     BN_CTX *ctx = NULL;
 
     snprintf(p_path, sizeof(p_path), "%s/primes/%d/p.prime", pem_dir, bits);
@@ -693,41 +714,42 @@ static EVP_PKEY *rsa_from_primes(const char *pem_dir, int bits) {
     /* iqmp = q^(-1) mod p */
     BN_mod_inverse(iqmp, q, p, ctx);
 
-    /* Create RSA key */
-    rsa = RSA_new();
-    if (!rsa) goto cleanup;
+    /* OpenSSL 3.0+: Build RSA key using OSSL_PARAM */
+    bld = OSSL_PARAM_BLD_new();
+    if (!bld) goto cleanup;
 
-    /* RSA_set0_* functions take ownership of BIGNUMs on success */
-    if (!RSA_set0_key(rsa, BN_dup(n), BN_dup(e), BN_dup(d))) {
-        RSA_free(rsa);
-        rsa = NULL;
-        goto cleanup;
-    }
-    if (!RSA_set0_factors(rsa, BN_dup(p), BN_dup(q))) {
-        RSA_free(rsa);
-        rsa = NULL;
-        goto cleanup;
-    }
-    if (!RSA_set0_crt_params(rsa, BN_dup(dmp1), BN_dup(dmq1), BN_dup(iqmp))) {
-        RSA_free(rsa);
-        rsa = NULL;
+    if (!OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_N, n) ||
+        !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_E, e) ||
+        !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_D, d) ||
+        !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_FACTOR1, p) ||
+        !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_FACTOR2, q) ||
+        !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_EXPONENT1, dmp1) ||
+        !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_EXPONENT2, dmq1) ||
+        !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_COEFFICIENT1, iqmp)) {
         goto cleanup;
     }
 
-    /* Wrap in EVP_PKEY */
-    pkey = EVP_PKEY_new();
-    if (pkey) {
-        EVP_PKEY_assign_RSA(pkey, rsa);
-        rsa = NULL; /* pkey owns it now */
-        log_msg(LGG_DEBUG, "RSA-%d key loaded from pre-computed primes", bits);
+    params = OSSL_PARAM_BLD_to_param(bld);
+    if (!params) goto cleanup;
+
+    pctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
+    if (!pctx) goto cleanup;
+
+    if (EVP_PKEY_fromdata_init(pctx) <= 0 ||
+        EVP_PKEY_fromdata(pctx, &pkey, EVP_PKEY_KEYPAIR, params) <= 0) {
+        goto cleanup;
     }
+
+    log_msg(LGG_DEBUG, "RSA-%d key loaded from pre-computed primes (OpenSSL 3.0+)", bits);
 
 cleanup:
     BN_free(p); BN_free(q); BN_free(n); BN_free(d); BN_free(e);
     BN_free(p1); BN_free(q1); BN_free(phi);
     BN_free(dmp1); BN_free(dmq1); BN_free(iqmp);
     BN_CTX_free(ctx);
-    if (rsa) RSA_free(rsa);
+    OSSL_PARAM_BLD_free(bld);
+    OSSL_PARAM_free(params);
+    EVP_PKEY_CTX_free(pctx);
     return pkey;
 }
 
@@ -1442,6 +1464,26 @@ static int cert_index_rebuild(const char *pem_dir);
 static _Atomic uint64_t cert_index_total_entries = 0;
 static char *cert_index_base_path = NULL;
 
+/* UDP write queue for high-throughput DGA attack scenarios */
+static _Atomic int g_udp_index_enabled = 0;
+static uint16_t g_udp_index_port = INDEX_UDP_DEFAULT_PORT;
+
+/* Initialize UDP client for index updates (call after fork in workers) */
+void cert_index_udp_init(const char *master_host, uint16_t port) {
+    if (port > 0) g_udp_index_port = port;
+    if (index_udp_client_init(master_host, g_udp_index_port) == 0) {
+        atomic_store(&g_udp_index_enabled, 1);
+        log_msg(LGG_NOTICE, "UDP index client initialized (port %u)", g_udp_index_port);
+    }
+}
+
+/* Shutdown UDP client */
+void cert_index_udp_shutdown(void) {
+    if (atomic_exchange(&g_udp_index_enabled, 0)) {
+        index_udp_client_shutdown();
+    }
+}
+
 /* Get shard number from domain name using FNV-1a hash */
 static inline int cert_index_shard(const char *domain) {
     uint32_t hash = fnv1a_hash(domain);
@@ -1674,9 +1716,44 @@ static int cert_index_init(const char *pem_dir) {
     return 0;
 }
 
-/* Add certificate to appropriate shard - lock-free (append is atomic on POSIX) */
+/* Add certificate to appropriate shard - lock-free (append is atomic on POSIX)
+ * If UDP index is enabled, sends fire-and-forget update via UDP instead of
+ * direct file write - optimal for DGA attack scenarios with thousands of
+ * new domains per second */
 static int cert_index_add(const char *pem_dir, const char *domain, time_t created,
                           int validity_days, int key_type) {
+    time_t expires = created + (validity_days * 24 * 3600);
+
+    /* Convert key_type to cert_algo_t for UDP */
+    cert_algo_t algo;
+    switch (key_type) {
+    case 5:  /* ECDSA-P256 */
+    case 6:  /* ECDSA-P384 */
+        algo = CERT_ALG_ECDSA;
+        break;
+    case 7:  /* SM2 */
+        algo = CERT_ALG_SM2;
+        break;
+    default: /* RSA variants */
+        algo = CERT_ALG_RSA;
+        break;
+    }
+
+    /* If UDP enabled, send fire-and-forget update to master */
+    if (atomic_load(&g_udp_index_enabled)) {
+        /* Generate a simple cert_id from hash */
+        uint32_t cert_id = fnv1a_hash(domain) & 0x00FFFFFF;
+        if (index_udp_client_insert(domain, algo, cert_id, (uint64_t)expires) == 0) {
+            /* Also add to local memory index for fast lookups */
+            cert_index_mem_insert(domain, expires);
+            atomic_fetch_add(&cert_index_total_entries, 1);
+            return 0;
+        }
+        /* Fall through to direct write if UDP fails */
+        log_msg(LGG_DEBUG, "%s: UDP send failed, falling back to direct write", __FUNCTION__);
+    }
+
+    /* Direct file write (original behavior) */
     char path[PIXELSERV_MAX_PATH];
     int shard = cert_index_shard(domain);
 
@@ -1690,7 +1767,6 @@ static int cert_index_add(const char *pem_dir, const char *domain, time_t create
         return -1;
     }
 
-    time_t expires = created + (validity_days * 24 * 3600);
     fprintf(fp, "%s\t%ld\t%ld\t%d\n", domain, (long)created, (long)expires, key_type);
     fclose(fp);
 

@@ -431,6 +431,10 @@ void cert_algo_path(char *path, size_t path_len, const char *pem_dir,
 void cert_algo_rootca_path(char *path, size_t path_len, const char *pem_dir,
                            cert_algo_t algo, const char *filename);
 
+/* UDP index client for high-throughput DGA scenarios */
+void cert_index_udp_init(const char *master_host, uint16_t port);
+void cert_index_udp_shutdown(void);
+
 #ifdef TLS1_3_VERSION
 int tls_clienthello_cb(SSL *ssl, int *ad, void *arg);
 char* read_tls_early_data(SSL *ssl, int *err);
