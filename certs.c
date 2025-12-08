@@ -1109,10 +1109,13 @@ static void generate_cert_algo(char* pem_fn, const char *pem_dir, cert_algo_t al
     /* Use new multi-algorithm path structure: {pem_dir}/{algo}/certs/{domain}.pem */
     cert_algo_path(fname, PIXELSERV_MAX_PATH, pem_dir, algo, pem_fn);
 
-    /* Ensure certs directory exists */
+    /* Ensure algo directory and certs subdirectory exist */
+    char algo_dir[PIXELSERV_MAX_PATH];
     char certs_dir[PIXELSERV_MAX_PATH];
+    snprintf(algo_dir, PIXELSERV_MAX_PATH, "%s/%s", pem_dir, cert_algo_name(algo));
     snprintf(certs_dir, PIXELSERV_MAX_PATH, "%s/%s/certs", pem_dir, cert_algo_name(algo));
-    mkdir(certs_dir, 0755);  /* Ignore error if exists */
+    mkdir(algo_dir, 0755);   /* Create algo directory first */
+    mkdir(certs_dir, 0755);  /* Then create certs subdirectory */
 
     FILE *fp = fopen(fname, "wb");
     if(fp == NULL) {
@@ -2242,6 +2245,7 @@ static int tls_servername_cb(SSL *ssl, int *ad, void *arg) {
     tlsext_cb_arg_struct *cbarg = (tlsext_cb_arg_struct *)arg;
     char full_pem_path[PIXELSERV_MAX_PATH + 1 + 1]; /* worst case ':\0' */
     int len;
+    char server_ip_buf[INET6_ADDRSTRLEN] = {0};
 
     /* Detect preferred algorithm from client hello signature_algorithms extension */
     cert_algo_t algo = detect_preferred_algo(ssl);
@@ -2255,18 +2259,50 @@ static int tls_servername_cb(SSL *ssl, int *ad, void *arg) {
 #ifdef TLS1_3_VERSION
     srv_name = (char*)get_server_name(ssl);
 #else
-    srv_name = (char*)(char*)SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    srv_name = (char*)SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
 #endif
-    if (srv_name)
+
+    /* SNI hostname handling with fallback to server IP */
+    if (srv_name) {
         strncpy(cbarg->servername, srv_name, sizeof(cbarg->servername) - 1);
-    else if (strlen(cbarg->servername))
+        cbarg->servername[sizeof(cbarg->servername) - 1] = '\0';
+    } else if (strlen(cbarg->servername) > 0) {
+        /* Pre-populated servername from connection setup */
         srv_name = cbarg->servername;
-    else {
-#ifdef DEBUG
-        log_msg(LGG_WARNING, "SNI failed. server name and ip empty.");
-#endif
-        rv = CB_ERR;
-        goto quit_cb;
+    } else {
+        /* No SNI provided - get server IP from socket as fallback
+         * This is common for IP address connections (e.g., https://127.0.0.1) */
+        int fd = SSL_get_fd(ssl);
+        if (fd >= 0) {
+            struct sockaddr_storage sin_addr;
+            socklen_t sin_addr_len = sizeof(sin_addr);
+            if (getsockname(fd, (struct sockaddr*)&sin_addr, &sin_addr_len) == 0) {
+                if (sin_addr.ss_family == AF_INET) {
+                    struct sockaddr_in *s = (struct sockaddr_in *)&sin_addr;
+                    inet_ntop(AF_INET, &s->sin_addr, server_ip_buf, sizeof(server_ip_buf));
+                } else if (sin_addr.ss_family == AF_INET6) {
+                    struct sockaddr_in6 *s = (struct sockaddr_in6 *)&sin_addr;
+                    /* Check for IPv4-mapped IPv6 address */
+                    if (IN6_IS_ADDR_V4MAPPED(&s->sin6_addr)) {
+                        struct in_addr ipv4_addr;
+                        memcpy(&ipv4_addr, &s->sin6_addr.s6_addr[12], 4);
+                        inet_ntop(AF_INET, &ipv4_addr, server_ip_buf, sizeof(server_ip_buf));
+                    } else {
+                        inet_ntop(AF_INET6, &s->sin6_addr, server_ip_buf, sizeof(server_ip_buf));
+                    }
+                }
+            }
+        }
+        if (strlen(server_ip_buf) > 0) {
+            strncpy(cbarg->servername, server_ip_buf, sizeof(cbarg->servername) - 1);
+            cbarg->servername[sizeof(cbarg->servername) - 1] = '\0';
+            srv_name = cbarg->servername;
+            log_msg(LGG_DEBUG, "No SNI provided, using server IP: %s", srv_name);
+        } else {
+            log_msg(LGG_WARNING, "SNI callback failed: no servername and cannot determine server IP");
+            rv = CB_ERR;
+            goto quit_cb;
+        }
     }
 #ifdef DEBUG
     printf("SNI servername: %s\n", srv_name);

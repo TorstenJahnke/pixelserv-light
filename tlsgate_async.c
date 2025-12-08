@@ -357,16 +357,23 @@ static int io_completion_handler(event_loop_t *uring, async_connection_t *conn, 
  */
 
 static int setup_listening_socket(int port, int *listen_fd) {
-    struct sockaddr_in addr;
+    /* Use IPv6 socket with dual-stack (accepts both IPv4 and IPv6) */
+    struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = in6addr_any;  /* Listen on all interfaces (IPv4 + IPv6) */
+    addr.sin6_port = htons(port);
 
-    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    int fd = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) {
         log_msg(LGG_ERR, "socket() failed for port %d: %m", port);
         return -1;
+    }
+
+    /* IPV6_V6ONLY=0: Enable dual-stack (IPv4-mapped IPv6 addresses) */
+    int v6only = 0;
+    if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) < 0) {
+        log_msg(LGG_WARNING, "setsockopt(IPV6_V6ONLY=0) failed: %m - IPv4 may not work");
     }
 
     /* SO_REUSEADDR: Allow immediate reuse of port */
@@ -400,7 +407,7 @@ static int setup_listening_socket(int port, int *listen_fd) {
     }
 
     *listen_fd = fd;
-    log_msg(LGG_NOTICE, "Listening on port %d with SO_REUSEPORT (fd=%d)", port, fd);
+    log_msg(LGG_NOTICE, "Listening on port %d (IPv4+IPv6) with SO_REUSEPORT (fd=%d)", port, fd);
     return 0;
 }
 
