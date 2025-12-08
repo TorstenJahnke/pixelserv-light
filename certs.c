@@ -73,6 +73,68 @@ static tlsext_cb_arg_struct g_sslctx_cb_arg;
 #define HASH_OCCUPIED  2   /* Slot contains valid data */
 #define HASH_DELETED   3   /* Tombstone - was occupied, now deleted */
 
+/* =============================================================================
+ * DEFERRED SSL_CTX GARBAGE COLLECTION
+ * Fix: Prevent use-after-free by deferring SSL_CTX_free() calls.
+ * Old contexts are collected in a ring buffer and freed after a delay,
+ * giving readers time to finish using them.
+ * ============================================================================= */
+#define SSLCTX_GC_QUEUE_SIZE 256
+#define SSLCTX_GC_DELAY_SECONDS 10
+
+typedef struct {
+    SSL_CTX *ctx;
+    uint32_t free_after;  /* Seconds since process start when safe to free */
+} sslctx_gc_entry_t;
+
+static sslctx_gc_entry_t sslctx_gc_queue[SSLCTX_GC_QUEUE_SIZE];
+static _Atomic uint32_t sslctx_gc_head = 0;
+static _Atomic uint32_t sslctx_gc_tail = 0;
+
+/* Enqueue SSL_CTX for deferred freeing (lock-free) */
+static void sslctx_gc_defer_free(SSL_CTX *ctx) {
+    if (!ctx) return;
+
+    uint32_t head, next_head, tail;
+    do {
+        head = atomic_load_explicit(&sslctx_gc_head, memory_order_relaxed);
+        next_head = (head + 1) & (SSLCTX_GC_QUEUE_SIZE - 1);
+        tail = atomic_load_explicit(&sslctx_gc_tail, memory_order_acquire);
+
+        if (next_head == tail) {
+            /* Queue full - force immediate cleanup of oldest entry */
+            SSL_CTX_free(ctx);
+            return;
+        }
+    } while (!atomic_compare_exchange_weak_explicit(&sslctx_gc_head,
+                &head, next_head, memory_order_acq_rel, memory_order_relaxed));
+
+    sslctx_gc_queue[head].ctx = ctx;
+    sslctx_gc_queue[head].free_after = process_uptime() + SSLCTX_GC_DELAY_SECONDS;
+}
+
+/* Process GC queue - free contexts that are old enough (call periodically) */
+static void sslctx_gc_process(void) {
+    uint32_t now = process_uptime();
+    uint32_t tail, head, next_tail;
+
+    while (1) {
+        tail = atomic_load_explicit(&sslctx_gc_tail, memory_order_relaxed);
+        head = atomic_load_explicit(&sslctx_gc_head, memory_order_acquire);
+
+        if (tail == head) break;  /* Queue empty */
+
+        /* Check if oldest entry is ready to be freed */
+        if (sslctx_gc_queue[tail].free_after > now) break;  /* Not yet */
+
+        next_tail = (tail + 1) & (SSLCTX_GC_QUEUE_SIZE - 1);
+        if (atomic_compare_exchange_weak_explicit(&sslctx_gc_tail,
+                    &tail, next_tail, memory_order_acq_rel, memory_order_relaxed)) {
+            SSL_CTX_free(sslctx_gc_queue[tail].ctx);
+        }
+    }
+}
+
 /* Hash table entry - each entry is independently atomic */
 typedef struct {
     _Atomic uint32_t state;      /* EMPTY, INSERTING, OCCUPIED, DELETED */
@@ -373,7 +435,7 @@ static int sslctx_hash_insert(const char *cert_name, SSL_CTX *sslctx) {
                 SSL_CTX *old = atomic_exchange(&sslctx_hash_tbl[idx].sslctx, sslctx);
                 atomic_store(&sslctx_hash_tbl[idx].last_use, process_uptime());
                 atomic_fetch_add(&sslctx_hash_tbl[idx].reuse_count, 1);
-                if (old && old != sslctx) SSL_CTX_free(old);
+                if (old && old != sslctx) sslctx_gc_defer_free(old);  /* Fix: Deferred free to prevent use-after-free */
                 return 1;  /* Updated existing */
             }
         }
@@ -399,7 +461,7 @@ static int sslctx_hash_insert(const char *cert_name, SSL_CTX *sslctx) {
                 return -1;
             }
             SSL_CTX *old = atomic_exchange(&sslctx_hash_tbl[idx].sslctx, sslctx);
-            if (old) SSL_CTX_free(old);
+            if (old) sslctx_gc_defer_free(old);  /* Fix: Deferred free */
             atomic_store(&sslctx_hash_tbl[idx].last_use, process_uptime());
             atomic_store(&sslctx_hash_tbl[idx].reuse_count, 0);
             atomic_store_explicit(&sslctx_hash_tbl[idx].state, HASH_OCCUPIED, memory_order_release);
@@ -433,7 +495,7 @@ static int sslctx_hash_delete(const char *cert_name) {
             uint32_t expected = HASH_OCCUPIED;
             if (atomic_compare_exchange_strong(&sslctx_hash_tbl[idx].state, &expected, HASH_DELETED)) {
                 SSL_CTX *old = atomic_exchange(&sslctx_hash_tbl[idx].sslctx, NULL);
-                if (old) SSL_CTX_free(old);
+                if (old) sslctx_gc_defer_free(old);  /* Fix: Deferred free */
                 atomic_fetch_sub(&sslctx_hash_count, 1);
                 atomic_fetch_add(&sslctx_tbl_cnt_purge, 1);
                 return 0;
@@ -564,6 +626,10 @@ static int sslctx_tbl_check_and_flush(void)
 {
     int pixel_now = process_uptime(), rv = -1;
     unsigned int last_flush = atomic_load_explicit(&sslctx_tbl_last_flush, memory_order_relaxed);
+
+    /* Process deferred SSL_CTX garbage collection */
+    sslctx_gc_process();
+
 #ifdef DEBUG
     printf("%s: now %d last_flush %d", __FUNCTION__, pixel_now, last_flush);
 #endif
@@ -1934,22 +2000,28 @@ static _Atomic int certgen_shutdown = 0;
 static pthread_t certgen_workers[CERTGEN_POOL_SIZE];
 static cert_tlstor_t *certgen_ctx = NULL;
 
-/* Enqueue work item - called from SNI callback (lock-free, non-blocking) */
+/* Enqueue work item - called from SNI callback (lock-free, non-blocking)
+ * Fix: Use CAS loop to prevent race condition where multiple threads
+ * could read the same head index and overwrite each other's data */
 int certgen_enqueue(const char *domain) {
-    uint32_t head = atomic_load_explicit(&certgen_queue_head, memory_order_relaxed);
-    uint32_t next_head = (head + 1) & (CERTGEN_QUEUE_SIZE - 1);
-    uint32_t tail = atomic_load_explicit(&certgen_queue_tail, memory_order_acquire);
+    uint32_t head, next_head, tail;
 
-    if (next_head == tail) {
-        /* Queue full - drop this request (will be retried by client) */
-        return -1;
-    }
+    do {
+        head = atomic_load_explicit(&certgen_queue_head, memory_order_relaxed);
+        next_head = (head + 1) & (CERTGEN_QUEUE_SIZE - 1);
+        tail = atomic_load_explicit(&certgen_queue_tail, memory_order_acquire);
 
+        if (next_head == tail) {
+            /* Queue full - drop this request (will be retried by client) */
+            return -1;
+        }
+    } while (!atomic_compare_exchange_weak_explicit(&certgen_queue_head,
+                &head, next_head, memory_order_acq_rel, memory_order_relaxed));
+
+    /* Now we have exclusive access to queue[head] */
     strncpy(certgen_queue[head].domain, domain, PIXELSERV_MAX_SERVER_NAME);
     certgen_queue[head].domain[PIXELSERV_MAX_SERVER_NAME] = '\0';
 
-    /* Publish - make visible to consumers */
-    atomic_store_explicit(&certgen_queue_head, next_head, memory_order_release);
     return 0;
 }
 
@@ -2359,6 +2431,11 @@ static SSL_SESSION *get_session(SSL *ssl, unsigned char *id, int idlen, int *do_
 static SSL_CTX* create_child_sslctx(const char* full_pem_path, const STACK_OF(X509_INFO) *cachain)
 {
     SSL_CTX *sslctx = SSL_CTX_new(SSLv23_server_method());
+    /* Fix: NULL check after SSL_CTX_new() to prevent NULL pointer dereference */
+    if (!sslctx) {
+        log_msg(LGG_ERR, "%s: SSL_CTX_new() failed", __FUNCTION__);
+        return NULL;
+    }
 #if OPENSSL_VERSION_NUMBER < 0x10101000L
     EC_KEY *ecdh = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
     if (!ecdh)
@@ -2430,6 +2507,11 @@ SSL_CTX* create_default_sslctx(const char *pem_dir, X509_NAME *issuer, EVP_PKEY 
         return g_sslctx;
 
     g_sslctx = SSL_CTX_new(SSLv23_server_method());
+    /* Fix: NULL check after SSL_CTX_new() to prevent NULL pointer dereference */
+    if (!g_sslctx) {
+        log_msg(LGG_ERR, "%s: SSL_CTX_new() failed", __FUNCTION__);
+        return NULL;
+    }
     SSL_CTX_set_options(g_sslctx,
           SSL_MODE_RELEASE_BUFFERS |
           SSL_OP_NO_COMPRESSION |

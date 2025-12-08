@@ -559,6 +559,13 @@ static int initialize(void) {
 
         if (pthread_create(&workers[i].tid, NULL, worker_thread_main, &workers[i]) != 0) {
             log_msg(LGG_ERR, "Failed to create worker thread %d", i);
+            /* Fix: Clean up already-started threads before returning */
+            shutdown_requested = 1;
+            for (int j = 0; j < i; j++) {
+                pthread_join(workers[j].tid, NULL);
+            }
+            free(workers);
+            workers = NULL;
             return -1;
         }
     }
@@ -606,10 +613,43 @@ static void cleanup(void) {
  * ============================================================================
  */
 
-int main(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
+static void print_usage(const char *progname) {
+    fprintf(stderr, "Usage: %s [options]\n", progname);
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -p PORT   HTTP port (default: 80)\n");
+    fprintf(stderr, "  -k PORT   HTTPS port (default: 443)\n");
+    fprintf(stderr, "  -D PATH   Certificate directory (default: %s)\n", DEFAULT_PEM_PATH);
+    fprintf(stderr, "  -l LEVEL  Log level 0-5 (default: 2=warning)\n");
+    fprintf(stderr, "  -h        Show this help\n");
+}
 
+int main(int argc, char *argv[]) {
+    int opt;
+    int log_level = LGG_WARNING;
+
+    /* Parse command line arguments */
+    while ((opt = getopt(argc, argv, "p:k:D:l:h")) != -1) {
+        switch (opt) {
+        case 'p':
+            listen_port_http = atoi(optarg);
+            break;
+        case 'k':
+            listen_port_https = atoi(optarg);
+            break;
+        case 'D':
+            pem_dir = optarg;
+            break;
+        case 'l':
+            log_level = atoi(optarg);
+            break;
+        case 'h':
+        default:
+            print_usage(argv[0]);
+            return (opt == 'h') ? EXIT_SUCCESS : EXIT_FAILURE;
+        }
+    }
+
+    log_set_verb(log_level);
     log_msg(LGG_NOTICE, "pixelserv-tls v3.0 async MULTI-THREADED (compiled %s %s)",
             __DATE__, __TIME__);
 
