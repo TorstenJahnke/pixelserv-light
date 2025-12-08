@@ -953,7 +953,8 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer,
     printf("%s: x509 cert created\n", __FUNCTION__);
 #endif
 
-    // -- save cert with correct PEM order: Certificate, CA-Chain, PrivateKey
+    // -- save cert with correct PEM order: PrivateKey, Certificate, CA-Chain
+    // This order matches what most TLS libraries expect
     if(pem_fn[0] == '*')
         pem_fn[0] = '_';
     snprintf(fname, PIXELSERV_MAX_PATH, "%s/%s.pem", pem_dir, pem_fn);
@@ -963,10 +964,15 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer,
         goto free_all;
     }
 
-    /* 1. Write end-entity certificate first */
+    /* 1. Write private key first */
+    PEM_write_PrivateKey(fp, key, NULL, NULL, 0, NULL, NULL);
+
+    /* 2. Write end-entity certificate */
     PEM_write_X509(fp, x509);
 
-    /* 2. Write CA chain (intermediate and root certs) */
+    /* 3. Write CA chain (intermediate and root certs in correct order)
+     * Chain order: Signing CA (SubCA) -> Cross-signed (if any) -> Root CA
+     * The cachain is already built in correct order by cert_tlstor_init */
     if (cachain) {
         int i;
         for (i = 0; i < sk_X509_INFO_num(cachain); i++) {
@@ -977,8 +983,6 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer,
         }
     }
 
-    /* 3. Write private key last */
-    PEM_write_PrivateKey(fp, key, NULL, NULL, 0, NULL, NULL);
     fclose(fp);
 
     /* Add to sharded index (lock-free append to shard file) */
@@ -1155,24 +1159,44 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     ct->issuer = X509_NAME_dup(X509_get_subject_name(issuer_cert));
     X509_free(issuer_cert);
 
-    /* Build CA chain: SubCA (or SubCA cross-signed) + RootCA */
+    /*
+     * Build CA chain dynamically based on available certificates.
+     * TLS chain order (from server cert to root):
+     *   1. Signing CA (SubCA if present) - signs the server certificate
+     *   2. Cross-signed CA (SubCA.cs if present) - for transition compatibility
+     *   3. Root CA - trust anchor
+     *
+     * The chain should include all intermediate CAs needed to validate
+     * the server certificate up to a trusted root.
+     */
     if (use_subca) {
-        /* Try cross-signed SubCA first, fall back to regular SubCA */
+        /* SubCA mode: SubCA signs server certs, include full chain to RootCA */
+
+        /* First: Add SubCA (the signing CA) */
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/subca.crt", pem_dir);
+        load_cert_to_chain(&ct->cachain, cert_file);
+
+        /* Second: Add cross-signed SubCA if present (for older clients) */
         snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/subca.cs.crt", pem_dir);
-        if (!load_cert_to_chain(&ct->cachain, cert_file)) {
-            snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/subca.crt", pem_dir);
-            load_cert_to_chain(&ct->cachain, cert_file);
-        }
-        /* Add RootCA to chain */
+        load_cert_to_chain(&ct->cachain, cert_file);  /* OK if not found */
+
+        /* Third: Add RootCA (trust anchor) */
         snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/rootca.crt", pem_dir);
         load_cert_to_chain(&ct->cachain, cert_file);
+
+        log_msg(LGG_NOTICE, "CA chain built: SubCA -> [SubCA.cs] -> RootCA (%d certs)",
+                ct->cachain ? sk_X509_INFO_num(ct->cachain) : 0);
     } else {
-        /* Just RootCA or legacy ca.crt */
+        /* RootCA-only mode: RootCA directly signs server certs */
         snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/rootca.crt", pem_dir);
         if (!load_cert_to_chain(&ct->cachain, cert_file)) {
+            /* Fallback to legacy ca.crt */
             snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/ca.crt", pem_dir);
             load_cert_to_chain(&ct->cachain, cert_file);
         }
+
+        log_msg(LGG_NOTICE, "CA chain built: RootCA only (%d certs)",
+                ct->cachain ? sk_X509_INFO_num(ct->cachain) : 0);
     }
 
     if (ct->cachain == NULL)
