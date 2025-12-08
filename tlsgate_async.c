@@ -357,16 +357,23 @@ static int io_completion_handler(event_loop_t *uring, async_connection_t *conn, 
  */
 
 static int setup_listening_socket(int port, int *listen_fd) {
-    struct sockaddr_in addr;
+    /* Use IPv6 socket with dual-stack (accepts both IPv4 and IPv6) */
+    struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = in6addr_any;  /* Listen on all interfaces (IPv4 + IPv6) */
+    addr.sin6_port = htons(port);
 
-    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    int fd = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) {
         log_msg(LGG_ERR, "socket() failed for port %d: %m", port);
         return -1;
+    }
+
+    /* IPV6_V6ONLY=0: Enable dual-stack (IPv4-mapped IPv6 addresses) */
+    int v6only = 0;
+    if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) < 0) {
+        log_msg(LGG_WARNING, "setsockopt(IPV6_V6ONLY=0) failed: %m - IPv4 may not work");
     }
 
     /* SO_REUSEADDR: Allow immediate reuse of port */
@@ -400,7 +407,7 @@ static int setup_listening_socket(int port, int *listen_fd) {
     }
 
     *listen_fd = fd;
-    log_msg(LGG_NOTICE, "Listening on port %d with SO_REUSEPORT (fd=%d)", port, fd);
+    log_msg(LGG_NOTICE, "Listening on port %d (IPv4+IPv6) with SO_REUSEPORT (fd=%d)", port, fd);
     return 0;
 }
 
@@ -559,6 +566,13 @@ static int initialize(void) {
 
         if (pthread_create(&workers[i].tid, NULL, worker_thread_main, &workers[i]) != 0) {
             log_msg(LGG_ERR, "Failed to create worker thread %d", i);
+            /* Fix: Clean up already-started threads before returning */
+            shutdown_requested = 1;
+            for (int j = 0; j < i; j++) {
+                pthread_join(workers[j].tid, NULL);
+            }
+            free(workers);
+            workers = NULL;
             return -1;
         }
     }
@@ -606,10 +620,43 @@ static void cleanup(void) {
  * ============================================================================
  */
 
-int main(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
+static void print_usage(const char *progname) {
+    fprintf(stderr, "Usage: %s [options]\n", progname);
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -p PORT   HTTP port (default: 80)\n");
+    fprintf(stderr, "  -k PORT   HTTPS port (default: 443)\n");
+    fprintf(stderr, "  -D PATH   Certificate directory (default: %s)\n", DEFAULT_PEM_PATH);
+    fprintf(stderr, "  -l LEVEL  Log level 0-5 (default: 2=warning)\n");
+    fprintf(stderr, "  -h        Show this help\n");
+}
 
+int main(int argc, char *argv[]) {
+    int opt;
+    int log_level = LGG_WARNING;
+
+    /* Parse command line arguments */
+    while ((opt = getopt(argc, argv, "p:k:D:l:h")) != -1) {
+        switch (opt) {
+        case 'p':
+            listen_port_http = atoi(optarg);
+            break;
+        case 'k':
+            listen_port_https = atoi(optarg);
+            break;
+        case 'D':
+            pem_dir = optarg;
+            break;
+        case 'l':
+            log_level = atoi(optarg);
+            break;
+        case 'h':
+        default:
+            print_usage(argv[0]);
+            return (opt == 'h') ? EXIT_SUCCESS : EXIT_FAILURE;
+        }
+    }
+
+    log_set_verb(log_level);
     log_msg(LGG_NOTICE, "pixelserv-tls v3.0 async MULTI-THREADED (compiled %s %s)",
             __DATE__, __TIME__);
 

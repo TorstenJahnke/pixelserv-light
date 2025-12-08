@@ -230,8 +230,9 @@ void conn_cleanup(async_connection_t *conn) {
 int http_request_append_data(http_state_t *http, const char *data, size_t len) {
     if (!http || !data || len == 0) return 0;
 
-    if (http->request_len + len > http->request_capacity) {
-        log_msg(LGG_WARNING, "HTTP request buffer overflow: %zu + %zu > %zu",
+    /* Fix: Use >= to ensure space for null terminator (off-by-one fix) */
+    if (http->request_len + len >= http->request_capacity) {
+        log_msg(LGG_WARNING, "HTTP request buffer overflow: %zu + %zu >= %zu",
                 http->request_len, len, http->request_capacity);
         return -1;
     }

@@ -5,8 +5,8 @@
 #include <openssl/ssl.h>
 #include "logger.h"
 
-/* Force DEBUG level for troubleshooting */
-static logger_level _verb = LGG_DEBUG;
+/* Default to WARNING level for production (was DEBUG for troubleshooting) */
+static logger_level _verb = LGG_WARNING;
 
 static int ctrl_char(char *buf, size_t len) {
     if (strlen(buf) < len)
