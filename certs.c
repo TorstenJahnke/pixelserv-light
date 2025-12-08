@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <openssl/bn.h>
 #include <openssl/crypto.h>
 #include <openssl/err.h>
@@ -730,16 +731,26 @@ cleanup:
     return pkey;
 }
 
-static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, EVP_PKEY *privkey)
+/* Robust IP address detection using inet_pton (lock-free, thread-safe)
+ * Returns: 4 for IPv4, 6 for IPv6, 0 for not an IP */
+static inline int is_ip_address(const char *addr) {
+    struct sockaddr_in sa4;
+    struct sockaddr_in6 sa6;
+    if (inet_pton(AF_INET, addr, &(sa4.sin_addr)) == 1) return 4;
+    if (inet_pton(AF_INET6, addr, &(sa6.sin6_addr)) == 1) return 6;
+    return 0;
+}
+
+static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer,
+                          EVP_PKEY *privkey, const STACK_OF(X509_INFO) *cachain)
 {
     char fname[PIXELSERV_MAX_PATH];
     EVP_PKEY *key = NULL;
     X509 *x509 = NULL;
     X509_EXTENSION *ext = NULL;
-#define SAN_STR_SIZE PIXELSERV_MAX_SERVER_NAME + 4 /* max("IP:", "DNS:") = 4 */
+#define SAN_STR_SIZE PIXELSERV_MAX_SERVER_NAME + 16 /* "IP:" or "DNS:" + domain + ",DNS:*.domain" */
     char san_str[SAN_STR_SIZE];
-    char *tld = NULL, *tld_tmp = NULL;
-    int dot_count = 0;
+    int ip_version;
     EVP_MD_CTX *p_ctx = NULL;
 
     p_ctx = EVP_MD_CTX_create();
@@ -902,14 +913,20 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
     X509_NAME *name = X509_get_subject_name(x509);
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char *)pem_fn, -1, -1, 0);
 
-    tld_tmp = strchr(pem_fn, '.');
-    while(tld_tmp != NULL) {
-        dot_count++;
-        tld = tld_tmp + 1;
-        tld_tmp = strchr(tld, '.');
+    /* Robust IP detection using inet_pton (thread-safe, lock-free) */
+    ip_version = is_ip_address(pem_fn);
+    if (ip_version > 0) {
+        /* IP address - use IP: SAN */
+        snprintf(san_str, SAN_STR_SIZE, "IP:%s", pem_fn);
+    } else if (pem_fn[0] == '*' && pem_fn[1] == '.') {
+        /* Wildcard cert: include both base domain AND wildcard in SAN
+         * e.g., *.example.co.uk -> DNS:example.co.uk,DNS:*.example.co.uk */
+        const char *base_domain = pem_fn + 2;  /* Skip "*." */
+        snprintf(san_str, SAN_STR_SIZE, "DNS:%s,DNS:%s", base_domain, pem_fn);
+    } else {
+        /* Regular domain */
+        snprintf(san_str, SAN_STR_SIZE, "DNS:%s", pem_fn);
     }
-    tld_tmp = (dot_count == 3 && (atoi(tld) > 0 || (atoi(tld) == 0 && strlen(tld) == 1))) ? "IP" : "DNS";
-    snprintf(san_str, SAN_STR_SIZE, "%s:%s", tld_tmp, pem_fn);
     if ((ext = X509V3_EXT_conf_nid(NULL, NULL, NID_subject_alt_name, san_str)) == NULL)
         goto free_all;
     if (X509_add_ext(x509, ext, -1) == 0) {
@@ -936,7 +953,8 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
     printf("%s: x509 cert created\n", __FUNCTION__);
 #endif
 
-    // -- save cert
+    // -- save cert with correct PEM order: PrivateKey, Certificate, CA-Chain
+    // This order matches what most TLS libraries expect
     if(pem_fn[0] == '*')
         pem_fn[0] = '_';
     snprintf(fname, PIXELSERV_MAX_PATH, "%s/%s.pem", pem_dir, pem_fn);
@@ -945,8 +963,26 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer, 
         log_msg(LGG_ERR, "%s: failed to open file for write: %s", __FUNCTION__, fname);
         goto free_all;
     }
+
+    /* 1. Write private key first */
     PEM_write_PrivateKey(fp, key, NULL, NULL, 0, NULL, NULL);
+
+    /* 2. Write end-entity certificate */
     PEM_write_X509(fp, x509);
+
+    /* 3. Write CA chain (intermediate and root certs in correct order)
+     * Chain order: Signing CA (SubCA) -> Cross-signed (if any) -> Root CA
+     * The cachain is already built in correct order by cert_tlstor_init */
+    if (cachain) {
+        int i;
+        for (i = 0; i < sk_X509_INFO_num(cachain); i++) {
+            X509_INFO *inf = sk_X509_INFO_value(cachain, i);
+            if (inf && inf->x509) {
+                PEM_write_X509(fp, inf->x509);
+            }
+        }
+    }
+
     fclose(fp);
 
     /* Add to sharded index (lock-free append to shard file) */
@@ -1123,24 +1159,44 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     ct->issuer = X509_NAME_dup(X509_get_subject_name(issuer_cert));
     X509_free(issuer_cert);
 
-    /* Build CA chain: SubCA (or SubCA cross-signed) + RootCA */
+    /*
+     * Build CA chain dynamically based on available certificates.
+     * TLS chain order (from server cert to root):
+     *   1. Signing CA (SubCA if present) - signs the server certificate
+     *   2. Cross-signed CA (SubCA.cs if present) - for transition compatibility
+     *   3. Root CA - trust anchor
+     *
+     * The chain should include all intermediate CAs needed to validate
+     * the server certificate up to a trusted root.
+     */
     if (use_subca) {
-        /* Try cross-signed SubCA first, fall back to regular SubCA */
+        /* SubCA mode: SubCA signs server certs, include full chain to RootCA */
+
+        /* First: Add SubCA (the signing CA) */
+        snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/subca.crt", pem_dir);
+        load_cert_to_chain(&ct->cachain, cert_file);
+
+        /* Second: Add cross-signed SubCA if present (for older clients) */
         snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/subca.cs.crt", pem_dir);
-        if (!load_cert_to_chain(&ct->cachain, cert_file)) {
-            snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/subca.crt", pem_dir);
-            load_cert_to_chain(&ct->cachain, cert_file);
-        }
-        /* Add RootCA to chain */
+        load_cert_to_chain(&ct->cachain, cert_file);  /* OK if not found */
+
+        /* Third: Add RootCA (trust anchor) */
         snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/rootca.crt", pem_dir);
         load_cert_to_chain(&ct->cachain, cert_file);
+
+        log_msg(LGG_NOTICE, "CA chain built: SubCA -> [SubCA.cs] -> RootCA (%d certs)",
+                ct->cachain ? sk_X509_INFO_num(ct->cachain) : 0);
     } else {
-        /* Just RootCA or legacy ca.crt */
+        /* RootCA-only mode: RootCA directly signs server certs */
         snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/rootca.crt", pem_dir);
         if (!load_cert_to_chain(&ct->cachain, cert_file)) {
+            /* Fallback to legacy ca.crt */
             snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/rootCA/ca.crt", pem_dir);
             load_cert_to_chain(&ct->cachain, cert_file);
         }
+
+        log_msg(LGG_NOTICE, "CA chain built: RootCA only (%d certs)",
+                ct->cachain ? sk_X509_INFO_num(ct->cachain) : 0);
     }
 
     if (ct->cachain == NULL)
@@ -1707,7 +1763,7 @@ static void *certgen_worker(void *arg) {
             char domain_copy[PIXELSERV_MAX_SERVER_NAME + 1];
             strncpy(domain_copy, domain, PIXELSERV_MAX_SERVER_NAME);
             domain_copy[PIXELSERV_MAX_SERVER_NAME] = '\0';
-            generate_cert(domain_copy, certgen_ctx->pem_dir, certgen_ctx->issuer, certgen_ctx->privkey);
+            generate_cert(domain_copy, certgen_ctx->pem_dir, certgen_ctx->issuer, certgen_ctx->privkey, certgen_ctx->cachain);
         }
     }
 
@@ -1815,7 +1871,7 @@ void *cert_generator(void *ptr) {
                 struct stat st;
                 snprintf(cert_file, PIXELSERV_MAX_PATH, "%s/%s", ct->pem_dir, p_buf);
                 if(stat(cert_file, &st) != 0) /* doesn't exist */
-                    generate_cert(p_buf, ct->pem_dir, ct->issuer, ct->privkey);
+                    generate_cert(p_buf, ct->pem_dir, ct->issuer, ct->privkey, ct->cachain);
             }
             p_buf = strtok_r(NULL, ":", &p_buf_sav);
         }
@@ -1973,10 +2029,15 @@ submit_missing_cert:
             char pem_file_copy[PIXELSERV_MAX_SERVER_NAME + 1];
             strncpy(pem_file_copy, pem_file, sizeof(pem_file_copy) - 1);
             pem_file_copy[sizeof(pem_file_copy) - 1] = '\0';
+            /* Remove .pem suffix from domain name (generate_cert adds it back) */
+            size_t pfc_len = strlen(pem_file_copy);
+            if (pfc_len > 4 && strcmp(pem_file_copy + pfc_len - 4, ".pem") == 0) {
+                pem_file_copy[pfc_len - 4] = '\0';
+            }
 #ifdef DEBUG
             log_msg(LGG_NOTICE, "Generating certificate for %s", pem_file_copy);
 #endif
-            generate_cert(pem_file_copy, cbarg->tls_pem, cbarg->issuer, cbarg->privkey);
+            generate_cert(pem_file_copy, cbarg->tls_pem, cbarg->issuer, cbarg->privkey, cbarg->cachain);
 
             /* Cert generated - now load it */
             if (stat(full_pem_path, &st) == 0) {
@@ -2109,7 +2170,8 @@ static SSL_CTX* create_child_sslctx(const char* full_pem_path, const STACK_OF(X5
     return sslctx;
 }
 
-SSL_CTX* create_default_sslctx(const char *pem_dir, X509_NAME *issuer, EVP_PKEY *privkey)
+SSL_CTX* create_default_sslctx(const char *pem_dir, X509_NAME *issuer, EVP_PKEY *privkey,
+                                const STACK_OF(X509_INFO) *cachain)
 {
     if (g_sslctx)
         return g_sslctx;
@@ -2138,6 +2200,7 @@ SSL_CTX* create_default_sslctx(const char *pem_dir, X509_NAME *issuer, EVP_PKEY 
     g_sslctx_cb_arg.tls_pem = pem_dir;
     g_sslctx_cb_arg.issuer = issuer;
     g_sslctx_cb_arg.privkey = privkey;
+    g_sslctx_cb_arg.cachain = cachain;
 
 #ifndef TLS1_3_VERSION
     /* TLS 1.2 and earlier: use servername callback */
@@ -2283,7 +2346,7 @@ void run_benchmark(const cert_tlstor_t *ct, const char *cert)
     for (c=1; c<=10; c++) {
         get_time(&tm);
         for (d=0; d<5; d++)
-            generate_cert(domain, ct->pem_dir, ct->issuer, ct->privkey);
+            generate_cert(domain, ct->pem_dir, ct->issuer, ct->privkey, ct->cachain);
         tm1 = elapsed_time_msec(tm) / 5.0;
         printf("%2d. generate cert to disk: %.3f ms\t", c, tm1);
         g_tm0 += tm1;

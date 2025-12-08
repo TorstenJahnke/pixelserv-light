@@ -37,9 +37,9 @@ stamp-h1
 
 # Built binaries
 tlsgate
+tlsgate-optimized
 tlsgate-test
 pixelserv-tls
 pixelserv-tls-test
 analyze.log
 build/
-tlsgate
