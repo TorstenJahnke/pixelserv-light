@@ -310,11 +310,40 @@
 # define PIXELSRV_SSL_HAS_ECDH_AUTO
 #endif
 
+/* =============================================================================
+   CERTIFICATE ALGORITHM TYPES
+   ============================================================================= */
+
+typedef enum {
+    CERT_ALG_RSA = 0,      /* RSA-3072 (default, widest compatibility) */
+    CERT_ALG_ECDSA = 1,    /* ECDSA P-256 (modern, fast) */
+    CERT_ALG_SM2 = 2,      /* SM2 (Chinese GM/T standard) */
+    CERT_ALG_LEGACY = 3,   /* Legacy RSA-2048 for old clients */
+    CERT_ALG_MAX = 4
+} cert_algo_t;
+
+/* Algorithm directory names */
+static const char *CERT_ALGO_DIRS[] = { "RSA", "ECDSA", "SM2", "LEGACY" };
+
+/* Get algorithm name string */
+static inline const char *cert_algo_name(cert_algo_t algo) {
+    return (algo < CERT_ALG_MAX) ? CERT_ALGO_DIRS[algo] : "RSA";
+}
+
+/* Per-algorithm CA storage */
 typedef struct {
-    const char* pem_dir;
-    STACK_OF(X509_INFO) *cachain;
     X509_NAME *issuer;
     EVP_PKEY *privkey;
+    STACK_OF(X509_INFO) *cachain;
+    int available;  /* 1 if this algorithm's CA is loaded */
+} cert_algo_ca_t;
+
+typedef struct {
+    const char* pem_dir;
+    STACK_OF(X509_INFO) *cachain;  /* Legacy: default CA chain */
+    X509_NAME *issuer;              /* Legacy: default issuer */
+    EVP_PKEY *privkey;              /* Legacy: default privkey */
+    cert_algo_ca_t algo_ca[CERT_ALG_MAX];  /* Per-algorithm CA storage */
 } cert_tlstor_t;
 
 typedef enum {
@@ -336,6 +365,8 @@ typedef struct {
     char server_ip[INET6_ADDRSTRLEN];
     ssl_enum status;
     int sslctx_idx;
+    cert_algo_t detected_algo;  /* Algorithm detected from client hello */
+    cert_algo_ca_t *algo_ca;    /* Pointer to per-algorithm CA array */
 } tlsext_cb_arg_struct;
 
 typedef struct {
@@ -378,7 +409,8 @@ int sslctx_tbl_get_sess_hit();
 int sslctx_tbl_get_sess_miss();
 int sslctx_tbl_get_sess_purge();
 SSL_CTX * create_default_sslctx(const char *pem_dir, X509_NAME *issuer, EVP_PKEY *privkey,
-                                 const STACK_OF(X509_INFO) *cachain);
+                                 const STACK_OF(X509_INFO) *cachain,
+                                 cert_algo_ca_t *algo_ca);
 int is_ssl_conn(int fd, char *srv_ip, int srv_ip_len, const int *ssl_ports, int num_ssl_ports);
 void conn_stor_init(int slots);
 void conn_stor_relinq(conn_tlstor_struct *p);
@@ -388,6 +420,21 @@ void conn_stor_flush();
 void certgen_pool_init(cert_tlstor_t *ct);
 void certgen_pool_shutdown(void);
 int certgen_enqueue(const char *domain);
+/* Algorithm detection from TLS client hello */
+cert_algo_t detect_preferred_algo(SSL *ssl);
+
+/* Build certificate path for algorithm */
+void cert_algo_path(char *path, size_t path_len, const char *pem_dir,
+                    cert_algo_t algo, const char *domain);
+
+/* Build rootCA path for algorithm */
+void cert_algo_rootca_path(char *path, size_t path_len, const char *pem_dir,
+                           cert_algo_t algo, const char *filename);
+
+/* UDP index client for high-throughput DGA scenarios */
+void cert_index_udp_init(const char *master_host, uint16_t port);
+void cert_index_udp_shutdown(void);
+
 #ifdef TLS1_3_VERSION
 int tls_clienthello_cb(SSL *ssl, int *ad, void *arg);
 char* read_tls_early_data(SSL *ssl, int *err);

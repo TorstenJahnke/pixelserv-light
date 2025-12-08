@@ -132,6 +132,16 @@ endif
 # Common sources for all platforms
 SRCS := tlsgate_async.c certs.c logger.c util.c async_connection.c
 
+# UDP Index support for high-throughput DGA scenarios
+# Enabled by default - disable with DISABLE_UDP_INDEX=1
+ifndef DISABLE_UDP_INDEX
+    SRCS += src/index_udp.c src/cert_index_sharded.c src/cert_index.c
+    BASE_CFLAGS += -DENABLE_UDP_INDEX
+    $(info UDP index support: enabled)
+else
+    $(info UDP index support: disabled)
+endif
+
 # Platform-specific event loop backend
 ifeq ($(UNAME_S),Linux)
     # Check if liburing is available
