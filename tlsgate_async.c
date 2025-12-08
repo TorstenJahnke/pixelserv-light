@@ -523,8 +523,10 @@ static int initialize(void) {
     sslctx_tbl_load(pem_dir, cert_tlstor.cachain);
 
     /* Create default SSL context with proper configuration
-     * Pass issuer and privkey for on-the-fly certificate generation */
-    ssl_ctx = create_default_sslctx(pem_dir, cert_tlstor.issuer, cert_tlstor.privkey, cert_tlstor.cachain);
+     * Pass issuer and privkey for on-the-fly certificate generation
+     * Also pass per-algorithm CA storage for multi-algo support */
+    ssl_ctx = create_default_sslctx(pem_dir, cert_tlstor.issuer, cert_tlstor.privkey,
+                                    cert_tlstor.cachain, cert_tlstor.algo_ca);
     if (!ssl_ctx) {
         log_msg(LGG_ERR, "Failed to create SSL context");
         return -1;

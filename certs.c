@@ -741,8 +741,128 @@ static inline int is_ip_address(const char *addr) {
     return 0;
 }
 
-static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer,
-                          EVP_PKEY *privkey, const STACK_OF(X509_INFO) *cachain)
+/* =============================================================================
+ * MULTI-ALGORITHM PATH FUNCTIONS
+ * Certificate paths: {pem_dir}/{algo}/certs/{domain}.pem
+ * RootCA paths: {pem_dir}/{algo}/rootCA/{filename}
+ * ============================================================================= */
+
+/* Build certificate path for specific algorithm
+ * Example: /opt/Aviontex/RSA/certs/example.com.pem */
+void cert_algo_path(char *path, size_t path_len, const char *pem_dir,
+                    cert_algo_t algo, const char *domain)
+{
+    snprintf(path, path_len, "%s/%s/certs/%s.pem",
+             pem_dir, cert_algo_name(algo), domain);
+}
+
+/* Build rootCA path for specific algorithm
+ * Example: /opt/Aviontex/RSA/rootCA/subca.crt */
+void cert_algo_rootca_path(char *path, size_t path_len, const char *pem_dir,
+                           cert_algo_t algo, const char *filename)
+{
+    snprintf(path, path_len, "%s/%s/rootCA/%s",
+             pem_dir, cert_algo_name(algo), filename);
+}
+
+/* Build index path for specific algorithm
+ * Example: /opt/Aviontex/RSA/index/ */
+static void cert_algo_index_path(char *path, size_t path_len, const char *pem_dir,
+                                 cert_algo_t algo)
+{
+    snprintf(path, path_len, "%s/%s/index",
+             pem_dir, cert_algo_name(algo));
+}
+
+/* =============================================================================
+ * ALGORITHM DETECTION FROM TLS CLIENT HELLO
+ * Parses signature_algorithms extension to determine client capabilities
+ * ============================================================================= */
+
+/* TLS SignatureScheme values (RFC 8446) */
+#define SIG_RSA_PKCS1_SHA256      0x0401
+#define SIG_RSA_PKCS1_SHA384      0x0501
+#define SIG_RSA_PKCS1_SHA512      0x0601
+#define SIG_ECDSA_SECP256R1_SHA256 0x0403
+#define SIG_ECDSA_SECP384R1_SHA384 0x0503
+#define SIG_ECDSA_SECP521R1_SHA512 0x0603
+#define SIG_RSA_PSS_RSAE_SHA256   0x0804
+#define SIG_RSA_PSS_RSAE_SHA384   0x0805
+#define SIG_RSA_PSS_RSAE_SHA512   0x0806
+#define SIG_SM2SIG_SM3            0x0708  /* GM/T 0024-2014 */
+
+/* Detect preferred algorithm from TLS client hello
+ * Parses signature_algorithms extension (type 13)
+ * Priority: ECDSA > SM2 > RSA (ECDSA is faster for key generation) */
+cert_algo_t detect_preferred_algo(SSL *ssl)
+{
+    const unsigned char *sigalgs = NULL;
+    size_t sigalgs_len = 0;
+    int has_ecdsa = 0, has_rsa = 0, has_sm2 = 0;
+
+#ifdef TLS1_3_VERSION
+    /* Get signature_algorithms extension from client hello */
+    if (!SSL_client_hello_get0_ext(ssl, TLSEXT_TYPE_signature_algorithms,
+                                   &sigalgs, &sigalgs_len)) {
+        /* No extension - default to RSA for maximum compatibility */
+        return CERT_ALG_RSA;
+    }
+
+    /* Skip 2-byte length field at start of extension */
+    if (sigalgs_len < 2) return CERT_ALG_RSA;
+    size_t list_len = (sigalgs[0] << 8) | sigalgs[1];
+    sigalgs += 2;
+    sigalgs_len -= 2;
+    if (list_len > sigalgs_len) list_len = sigalgs_len;
+
+    /* Parse SignatureScheme values (2 bytes each) */
+    for (size_t i = 0; i + 1 < list_len; i += 2) {
+        uint16_t scheme = (sigalgs[i] << 8) | sigalgs[i + 1];
+
+        switch (scheme) {
+        case SIG_ECDSA_SECP256R1_SHA256:
+        case SIG_ECDSA_SECP384R1_SHA384:
+        case SIG_ECDSA_SECP521R1_SHA512:
+            has_ecdsa = 1;
+            break;
+
+        case SIG_RSA_PKCS1_SHA256:
+        case SIG_RSA_PKCS1_SHA384:
+        case SIG_RSA_PKCS1_SHA512:
+        case SIG_RSA_PSS_RSAE_SHA256:
+        case SIG_RSA_PSS_RSAE_SHA384:
+        case SIG_RSA_PSS_RSAE_SHA512:
+            has_rsa = 1;
+            break;
+
+        case SIG_SM2SIG_SM3:
+            has_sm2 = 1;
+            break;
+        }
+    }
+#else
+    /* Pre-TLS 1.3: Use SSL_get_shared_sigalgs if available */
+    (void)ssl;
+    has_rsa = 1;  /* Default to RSA for older OpenSSL */
+#endif
+
+    /* Priority: ECDSA > SM2 > RSA
+     * ECDSA P-256 key generation is ~100x faster than RSA-3072 */
+    if (has_ecdsa) return CERT_ALG_ECDSA;
+#ifdef HAVE_SM2
+    if (has_sm2) return CERT_ALG_SM2;
+#endif
+    if (has_rsa) return CERT_ALG_RSA;
+
+    /* Fallback to RSA */
+    return CERT_ALG_RSA;
+}
+
+/* Generate certificate for a specific algorithm
+ * Uses new path structure: {pem_dir}/{algo}/certs/{domain}.pem */
+static void generate_cert_algo(char* pem_fn, const char *pem_dir, cert_algo_t algo,
+                               X509_NAME *issuer, EVP_PKEY *privkey,
+                               const STACK_OF(X509_INFO) *cachain)
 {
     char fname[PIXELSERV_MAX_PATH];
     EVP_PKEY *key = NULL;
@@ -759,77 +879,12 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer,
 
     if(pem_fn[0] == '_') pem_fn[0] = '*';
 
-    // -- generate key based on cert_key_type
-    // 0=RSA2048, 1=RSA3072, 2=RSA4096, 3=RSA8192, 4=RSA16384, 5=ECDSA-P256, 6=ECDSA-P384, 7=SM2
+    // -- generate key based on algorithm type (detected from client hello)
     BIGNUM *e = BN_new();
     BN_set_word(e, RSA_F4);
 
-    switch (cert_key_type) {
-    case 0: // RSA 2048
-        key = rsa_from_primes(pem_dir, 2048);
-        if (!key) {
-#if OPENSSL_VERSION_MAJOR >= 3
-            key = EVP_RSA_gen(2048);
-#else
-            RSA *rsa = RSA_new();
-            if (RSA_generate_key_ex(rsa, 2048, e, NULL) < 0) {
-                RSA_free(rsa);
-                goto free_all;
-            }
-            key = EVP_PKEY_new();
-            EVP_PKEY_assign_RSA(key, rsa);
-#endif
-        }
-        break;
-    case 2: // RSA 4096
-        key = rsa_from_primes(pem_dir, 4096);
-        if (!key) {
-#if OPENSSL_VERSION_MAJOR >= 3
-            key = EVP_RSA_gen(4096);
-#else
-            RSA *rsa = RSA_new();
-            if (RSA_generate_key_ex(rsa, 4096, e, NULL) < 0) {
-                RSA_free(rsa);
-                goto free_all;
-            }
-            key = EVP_PKEY_new();
-            EVP_PKEY_assign_RSA(key, rsa);
-#endif
-        }
-        break;
-    case 3: // RSA 8192
-        key = rsa_from_primes(pem_dir, 8192);
-        if (!key) {
-#if OPENSSL_VERSION_MAJOR >= 3
-            key = EVP_RSA_gen(8192);
-#else
-            RSA *rsa = RSA_new();
-            if (RSA_generate_key_ex(rsa, 8192, e, NULL) < 0) {
-                RSA_free(rsa);
-                goto free_all;
-            }
-            key = EVP_PKEY_new();
-            EVP_PKEY_assign_RSA(key, rsa);
-#endif
-        }
-        break;
-    case 4: // RSA 16384
-        key = rsa_from_primes(pem_dir, 16384);
-        if (!key) {
-#if OPENSSL_VERSION_MAJOR >= 3
-            key = EVP_RSA_gen(16384);
-#else
-            RSA *rsa = RSA_new();
-            if (RSA_generate_key_ex(rsa, 16384, e, NULL) < 0) {
-                RSA_free(rsa);
-                goto free_all;
-            }
-            key = EVP_PKEY_new();
-            EVP_PKEY_assign_RSA(key, rsa);
-#endif
-        }
-        break;
-    case 5: // ECDSA P-256
+    switch (algo) {
+    case CERT_ALG_ECDSA: // ECDSA P-256 (fast key generation)
 #if OPENSSL_VERSION_MAJOR >= 3
         key = EVP_EC_gen("P-256");
 #else
@@ -844,23 +899,9 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer,
         }
 #endif
         break;
-    case 6: // ECDSA P-384
-#if OPENSSL_VERSION_MAJOR >= 3
-        key = EVP_EC_gen("P-384");
-#else
-        {
-            EC_KEY *ec = EC_KEY_new_by_curve_name(NID_secp384r1);
-            if (!ec || !EC_KEY_generate_key(ec)) {
-                if (ec) EC_KEY_free(ec);
-                goto free_all;
-            }
-            key = EVP_PKEY_new();
-            EVP_PKEY_assign_EC_KEY(key, ec);
-        }
-#endif
-        break;
+
 #ifdef HAVE_SM2
-    case 7: // SM2 (Tongsuo only)
+    case CERT_ALG_SM2: // SM2 (Chinese GM/T standard)
 #if OPENSSL_VERSION_MAJOR >= 3
         key = EVP_EC_gen("SM2");
 #else
@@ -876,7 +917,25 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer,
 #endif
         break;
 #endif
-    case 1: // RSA 3072 (default)
+
+    case CERT_ALG_LEGACY: // RSA-2048 (legacy clients)
+        key = rsa_from_primes(pem_dir, 2048);
+        if (!key) {
+#if OPENSSL_VERSION_MAJOR >= 3
+            key = EVP_RSA_gen(2048);
+#else
+            RSA *rsa = RSA_new();
+            if (RSA_generate_key_ex(rsa, 2048, e, NULL) < 0) {
+                RSA_free(rsa);
+                goto free_all;
+            }
+            key = EVP_PKEY_new();
+            EVP_PKEY_assign_RSA(key, rsa);
+#endif
+        }
+        break;
+
+    case CERT_ALG_RSA: // RSA-3072 (default, wide compatibility)
     default:
         key = rsa_from_primes(pem_dir, 3072);
         if (!key) {
@@ -899,7 +958,7 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer,
         goto free_all;
 
 #ifdef DEBUG
-    printf("%s: key (type %d) generated for [%s]\n", __FUNCTION__, cert_key_type, pem_fn);
+    printf("%s: key (algo %s) generated for [%s]\n", __FUNCTION__, cert_algo_name(algo), pem_fn);
 #endif
     if((x509 = X509_new()) == NULL)
         goto free_all;
@@ -957,7 +1016,15 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer,
     // This order matches what most TLS libraries expect
     if(pem_fn[0] == '*')
         pem_fn[0] = '_';
-    snprintf(fname, PIXELSERV_MAX_PATH, "%s/%s.pem", pem_dir, pem_fn);
+
+    /* Use new multi-algorithm path structure: {pem_dir}/{algo}/certs/{domain}.pem */
+    cert_algo_path(fname, PIXELSERV_MAX_PATH, pem_dir, algo, pem_fn);
+
+    /* Ensure certs directory exists */
+    char certs_dir[PIXELSERV_MAX_PATH];
+    snprintf(certs_dir, PIXELSERV_MAX_PATH, "%s/%s/certs", pem_dir, cert_algo_name(algo));
+    mkdir(certs_dir, 0755);  /* Ignore error if exists */
+
     FILE *fp = fopen(fname, "wb");
     if(fp == NULL) {
         log_msg(LGG_ERR, "%s: failed to open file for write: %s", __FUNCTION__, fname);
@@ -986,9 +1053,10 @@ static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer,
     fclose(fp);
 
     /* Add to sharded index (lock-free append to shard file) */
-    cert_index_add(pem_dir, pem_fn, time(NULL), cert_validity_days, cert_key_type);
+    cert_index_add(pem_dir, pem_fn, time(NULL), cert_validity_days, (int)algo);
 
-    log_msg(LGG_NOTICE, "cert generated to disk: %s", pem_fn);
+    log_msg(LGG_NOTICE, "cert generated [%s]: %s/%s/certs/%s.pem",
+            cert_algo_name(algo), pem_dir, cert_algo_name(algo), pem_fn);
 
 free_all:
     BN_free(e);
@@ -998,6 +1066,12 @@ free_all:
     X509_free(x509);
 }
 
+/* Backward-compatible wrapper - uses default RSA algorithm */
+static void generate_cert(char* pem_fn, const char *pem_dir, X509_NAME *issuer,
+                          EVP_PKEY *privkey, const STACK_OF(X509_INFO) *cachain)
+{
+    generate_cert_algo(pem_fn, pem_dir, CERT_ALG_RSA, issuer, privkey, cachain);
+}
 
 /* Passphrase callback structure */
 typedef struct {
@@ -1241,6 +1315,84 @@ void cert_tlstor_init(const char *pem_dir, cert_tlstor_t *ct)
     else
         log_msg(LGG_NOTICE, "Loaded private key from ca.key (legacy)");
     if (fp) fclose(fp);
+
+    /*
+     * Load per-algorithm CAs from {pem_dir}/{algo}/rootCA/
+     * This enables serving different certificate types (RSA, ECDSA, SM2) based on client capabilities
+     */
+    for (int algo = 0; algo < CERT_ALG_MAX; algo++) {
+        char algo_rootca[PIXELSERV_MAX_PATH];
+        X509 *algo_issuer_cert = NULL;
+        int algo_use_subca = 0;
+
+        /* Try SubCA first */
+        cert_algo_rootca_path(algo_rootca, PIXELSERV_MAX_PATH, pem_dir, algo, "subca.crt");
+        fp = fopen(algo_rootca, "r");
+        if (fp) {
+            algo_issuer_cert = X509_new();
+            if (PEM_read_X509(fp, &algo_issuer_cert, NULL, NULL)) {
+                algo_use_subca = 1;
+            } else {
+                X509_free(algo_issuer_cert);
+                algo_issuer_cert = NULL;
+            }
+            fclose(fp);
+            fp = NULL;
+        }
+
+        /* Try RootCA */
+        if (!algo_issuer_cert) {
+            cert_algo_rootca_path(algo_rootca, PIXELSERV_MAX_PATH, pem_dir, algo, "rootca.crt");
+            fp = fopen(algo_rootca, "r");
+            if (fp) {
+                algo_issuer_cert = X509_new();
+                if (!PEM_read_X509(fp, &algo_issuer_cert, NULL, NULL)) {
+                    X509_free(algo_issuer_cert);
+                    algo_issuer_cert = NULL;
+                }
+                fclose(fp);
+                fp = NULL;
+            }
+        }
+
+        if (!algo_issuer_cert) {
+            /* No CA for this algorithm - will use default */
+            continue;
+        }
+
+        ct->algo_ca[algo].issuer = X509_NAME_dup(X509_get_subject_name(algo_issuer_cert));
+        X509_free(algo_issuer_cert);
+
+        /* Build CA chain for this algorithm */
+        if (algo_use_subca) {
+            cert_algo_rootca_path(algo_rootca, PIXELSERV_MAX_PATH, pem_dir, algo, "subca.crt");
+            load_cert_to_chain(&ct->algo_ca[algo].cachain, algo_rootca);
+            cert_algo_rootca_path(algo_rootca, PIXELSERV_MAX_PATH, pem_dir, algo, "subca.cs.crt");
+            load_cert_to_chain(&ct->algo_ca[algo].cachain, algo_rootca);
+            cert_algo_rootca_path(algo_rootca, PIXELSERV_MAX_PATH, pem_dir, algo, "rootca.crt");
+            load_cert_to_chain(&ct->algo_ca[algo].cachain, algo_rootca);
+        } else {
+            cert_algo_rootca_path(algo_rootca, PIXELSERV_MAX_PATH, pem_dir, algo, "rootca.crt");
+            load_cert_to_chain(&ct->algo_ca[algo].cachain, algo_rootca);
+        }
+
+        /* Load private key */
+        if (algo_use_subca) {
+            cert_algo_rootca_path(algo_rootca, PIXELSERV_MAX_PATH, pem_dir, algo, "subca.key");
+            passwd_arg.key_name = "subca";
+        } else {
+            cert_algo_rootca_path(algo_rootca, PIXELSERV_MAX_PATH, pem_dir, algo, "rootca.key");
+            passwd_arg.key_name = "rootca";
+        }
+
+        fp = fopen(algo_rootca, "r");
+        if (fp && PEM_read_PrivateKey(fp, &ct->algo_ca[algo].privkey, pem_passwd_cb, &passwd_arg)) {
+            ct->algo_ca[algo].available = 1;
+            log_msg(LGG_NOTICE, "Loaded %s CA from %s/%s/rootCA/",
+                    cert_algo_name(algo), pem_dir, cert_algo_name(algo));
+        }
+        if (fp) fclose(fp);
+    }
 }
 
 void cert_tlstor_cleanup(cert_tlstor_t *c)
@@ -1248,6 +1400,16 @@ void cert_tlstor_cleanup(cert_tlstor_t *c)
     sk_X509_INFO_pop_free(c->cachain, X509_INFO_free);
     X509_NAME_free(c->issuer);
     EVP_PKEY_free(c->privkey);
+
+    /* Clean up per-algorithm CAs */
+    for (int algo = 0; algo < CERT_ALG_MAX; algo++) {
+        if (c->algo_ca[algo].cachain)
+            sk_X509_INFO_pop_free(c->algo_ca[algo].cachain, X509_INFO_free);
+        if (c->algo_ca[algo].issuer)
+            X509_NAME_free(c->algo_ca[algo].issuer);
+        if (c->algo_ca[algo].privkey)
+            EVP_PKEY_free(c->algo_ca[algo].privkey);
+    }
 }
 
 /* =============================================================================
@@ -1932,11 +2094,13 @@ static int tls_servername_cb(SSL *ssl, int *ad, void *arg) {
     char full_pem_path[PIXELSERV_MAX_PATH + 1 + 1]; /* worst case ':\0' */
     int len;
 
-    len = strlen(cbarg->tls_pem);
-    full_pem_path[PIXELSERV_MAX_PATH] = '\0';
-    strncpy(full_pem_path, cbarg->tls_pem, PIXELSERV_MAX_PATH);
-    full_pem_path[len++] = '/';
-    full_pem_path[len] = '\0';
+    /* Detect preferred algorithm from client hello signature_algorithms extension */
+    cert_algo_t algo = detect_preferred_algo(ssl);
+    cbarg->detected_algo = algo;
+
+    /* Build base path: {pem_dir}/{algo}/certs/ */
+    len = snprintf(full_pem_path, PIXELSERV_MAX_PATH, "%s/%s/certs/",
+                   cbarg->tls_pem, cert_algo_name(algo));
 
     char *srv_name = NULL;
 #ifdef TLS1_3_VERSION
@@ -2029,15 +2193,26 @@ submit_missing_cert:
             char pem_file_copy[PIXELSERV_MAX_SERVER_NAME + 1];
             strncpy(pem_file_copy, pem_file, sizeof(pem_file_copy) - 1);
             pem_file_copy[sizeof(pem_file_copy) - 1] = '\0';
-            /* Remove .pem suffix from domain name (generate_cert adds it back) */
+            /* Remove .pem suffix from domain name (generate_cert_algo adds it back) */
             size_t pfc_len = strlen(pem_file_copy);
             if (pfc_len > 4 && strcmp(pem_file_copy + pfc_len - 4, ".pem") == 0) {
                 pem_file_copy[pfc_len - 4] = '\0';
             }
 #ifdef DEBUG
-            log_msg(LGG_NOTICE, "Generating certificate for %s", pem_file_copy);
+            log_msg(LGG_NOTICE, "Generating %s certificate for %s", cert_algo_name(algo), pem_file_copy);
 #endif
-            generate_cert(pem_file_copy, cbarg->tls_pem, cbarg->issuer, cbarg->privkey, cbarg->cachain);
+            /* Use algorithm-specific CA if available, else default */
+            X509_NAME *issuer = cbarg->issuer;
+            EVP_PKEY *privkey = cbarg->privkey;
+            const STACK_OF(X509_INFO) *cachain = cbarg->cachain;
+
+            if (cbarg->algo_ca && cbarg->algo_ca[algo].available) {
+                issuer = cbarg->algo_ca[algo].issuer;
+                privkey = cbarg->algo_ca[algo].privkey;
+                cachain = cbarg->algo_ca[algo].cachain;
+            }
+
+            generate_cert_algo(pem_file_copy, cbarg->tls_pem, algo, issuer, privkey, cachain);
 
             /* Cert generated - now load it */
             if (stat(full_pem_path, &st) == 0) {
@@ -2171,7 +2346,8 @@ static SSL_CTX* create_child_sslctx(const char* full_pem_path, const STACK_OF(X5
 }
 
 SSL_CTX* create_default_sslctx(const char *pem_dir, X509_NAME *issuer, EVP_PKEY *privkey,
-                                const STACK_OF(X509_INFO) *cachain)
+                                const STACK_OF(X509_INFO) *cachain,
+                                cert_algo_ca_t *algo_ca)
 {
     if (g_sslctx)
         return g_sslctx;
@@ -2201,6 +2377,7 @@ SSL_CTX* create_default_sslctx(const char *pem_dir, X509_NAME *issuer, EVP_PKEY 
     g_sslctx_cb_arg.issuer = issuer;
     g_sslctx_cb_arg.privkey = privkey;
     g_sslctx_cb_arg.cachain = cachain;
+    g_sslctx_cb_arg.algo_ca = algo_ca;  /* Per-algorithm CA storage */
 
 #ifndef TLS1_3_VERSION
     /* TLS 1.2 and earlier: use servername callback */
