@@ -2005,6 +2005,11 @@ submit_missing_cert:
             char pem_file_copy[PIXELSERV_MAX_SERVER_NAME + 1];
             strncpy(pem_file_copy, pem_file, sizeof(pem_file_copy) - 1);
             pem_file_copy[sizeof(pem_file_copy) - 1] = '\0';
+            /* Remove .pem suffix from domain name (generate_cert adds it back) */
+            size_t pfc_len = strlen(pem_file_copy);
+            if (pfc_len > 4 && strcmp(pem_file_copy + pfc_len - 4, ".pem") == 0) {
+                pem_file_copy[pfc_len - 4] = '\0';
+            }
 #ifdef DEBUG
             log_msg(LGG_NOTICE, "Generating certificate for %s", pem_file_copy);
 #endif
@@ -2141,7 +2146,8 @@ static SSL_CTX* create_child_sslctx(const char* full_pem_path, const STACK_OF(X5
     return sslctx;
 }
 
-SSL_CTX* create_default_sslctx(const char *pem_dir, X509_NAME *issuer, EVP_PKEY *privkey)
+SSL_CTX* create_default_sslctx(const char *pem_dir, X509_NAME *issuer, EVP_PKEY *privkey,
+                                const STACK_OF(X509_INFO) *cachain)
 {
     if (g_sslctx)
         return g_sslctx;
@@ -2170,6 +2176,7 @@ SSL_CTX* create_default_sslctx(const char *pem_dir, X509_NAME *issuer, EVP_PKEY 
     g_sslctx_cb_arg.tls_pem = pem_dir;
     g_sslctx_cb_arg.issuer = issuer;
     g_sslctx_cb_arg.privkey = privkey;
+    g_sslctx_cb_arg.cachain = cachain;
 
 #ifndef TLS1_3_VERSION
     /* TLS 1.2 and earlier: use servername callback */

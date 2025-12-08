@@ -524,7 +524,7 @@ static int initialize(void) {
 
     /* Create default SSL context with proper configuration
      * Pass issuer and privkey for on-the-fly certificate generation */
-    ssl_ctx = create_default_sslctx(pem_dir, cert_tlstor.issuer, cert_tlstor.privkey);
+    ssl_ctx = create_default_sslctx(pem_dir, cert_tlstor.issuer, cert_tlstor.privkey, cert_tlstor.cachain);
     if (!ssl_ctx) {
         log_msg(LGG_ERR, "Failed to create SSL context");
         return -1;
