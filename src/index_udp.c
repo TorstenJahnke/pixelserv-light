@@ -319,9 +319,10 @@ static void process_message(const uint8_t *buf, size_t len,
 static void flush_batch(void);
 
 int index_udp_server_init(const index_udp_server_config_t *config) {
-    if (!config || !config->index) {
+    if (!config) {
         return -1;
     }
+    /* Note: config->index can be NULL if using callbacks only */
 
     /* Apply configuration */
     g_server.index = config->index;
