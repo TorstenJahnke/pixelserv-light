@@ -766,13 +766,16 @@ void cert_algo_rootca_path(char *path, size_t path_len, const char *pem_dir,
 }
 
 /* Build index path for specific algorithm
- * Example: /opt/Aviontex/RSA/index/ */
+ * Example: /opt/Aviontex/RSA/index/
+ * TODO: Used when implementing per-algorithm index sharding */
+#if 0  /* Reserved for future per-algorithm index implementation */
 static void cert_algo_index_path(char *path, size_t path_len, const char *pem_dir,
                                  cert_algo_t algo)
 {
     snprintf(path, path_len, "%s/%s/index",
              pem_dir, cert_algo_name(algo));
 }
+#endif
 
 /* =============================================================================
  * ALGORITHM DETECTION FROM TLS CLIENT HELLO
@@ -849,9 +852,7 @@ cert_algo_t detect_preferred_algo(SSL *ssl)
     /* Priority: ECDSA > SM2 > RSA
      * ECDSA P-256 key generation is ~100x faster than RSA-3072 */
     if (has_ecdsa) return CERT_ALG_ECDSA;
-#ifdef HAVE_SM2
     if (has_sm2) return CERT_ALG_SM2;
-#endif
     if (has_rsa) return CERT_ALG_RSA;
 
     /* Fallback to RSA */
