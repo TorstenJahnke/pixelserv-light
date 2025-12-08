@@ -1,0 +1,20 @@
+[Unit]
+Description=Pixelserv-TLS Index Master
+Documentation=https://github.com/nicholasjamieson/pixelserv-tls
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pixelserv-index -z /usr/local/pixelserver -l 3
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/usr/local/pixelserver
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

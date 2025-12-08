@@ -1,0 +1,325 @@
+.TH PIXELSERV-TLS 1 "December 2025" "pixelserv-tls 3.0.18" "User Commands"
+.SH NAME
+pixelserv-tls \- minimal ad-blocking pixel server with TLS/HTTPS support
+.SH SYNOPSIS
+.B pixelserv-tls
+[\fIip_addr\fR | \fIhostname\fR]
+[\fB\-p\fR \fIHTTP_PORT\fR]
+[\fB\-k\fR \fIHTTPS_PORT\fR]
+[\fB\-a\fR \fIAUTO_PORT\fR]
+[\fB\-A\fR \fIADMIN_PORT\fR]
+[\fB\-n\fR \fIIFACE\fR]
+[\fB\-z\fR \fICERT_PATH\fR]
+[\fB\-c\fR \fICACHE_SIZE\fR]
+[\fB\-M\fR]
+[\fB\-m\fR \fISOCKET_PATH\fR]
+[\fB\-H\fR \fIHTML_FILE\fR]
+[\fB\-2\fR]
+[\fB\-R\fR]
+[\fB\-T\fR \fIMAX_THREADS\fR]
+[\fB\-O\fR \fIKEEPALIVE_SEC\fR]
+[\fB\-s\fR \fISTATS_URL\fR]
+[\fB\-t\fR \fISTATS_TXT_URL\fR]
+[\fB\-u\fR \fIUSER\fR]
+[\fB\-l\fR \fILEVEL\fR]
+[\fB\-f\fR]
+[\fB\-B\fR [\fICERT_FILE\fR]]
+
+.SH DESCRIPTION
+.B pixelserv-tls
+is a high-performance, minimal HTTP/HTTPS server designed for ad-blocking.
+It acts as a sinkhole for hundreds of thousands of advertising and tracking servers,
+responding to all requests with minimal content (1x1 pixel GIF, empty responses, etc.).
+
+.B pixelserv-tls
+supports TLS 1.0, TLS 1.2, and TLS 1.3 with SNI (Server Name Indication).
+Certificates for blocked domains are automatically generated on first visit
+and cached for reuse.
+
+.SS Key Features
+.IP \(bu 2
+Lock-free certificate generation and caching
+.IP \(bu 2
+Master/Worker architecture for multi-instance deployments
+.IP \(bu 2
+Anti-adblock bypass mechanisms
+.IP \(bu 2
+HTTP/1.1 persistent connections with keep-alive
+.IP \(bu 2
+TLS session resumption and 0-RTT early data
+.IP \(bu 2
+Comprehensive statistics and logging
+.IP \(bu 2
+Automatic root privilege dropping
+
+.SH OPTIONS
+
+.SS Network Options
+.TP
+.BR \fIip_addr\fR ", " \fIhostname\fR
+IP address or hostname to bind to. If omitted and no \fB\-n\fR specified,
+listens on 0.0.0.0 (all interfaces).
+.TP
+.BR \-p " " \fIHTTP_PORT\fR
+Port for HTTP connections. Can be specified multiple times for multiple ports.
+Default: 80.
+.TP
+.BR \-k " " \fIHTTPS_PORT\fR
+Port for HTTPS/TLS connections. Can be specified multiple times.
+Default: 443.
+.TP
+.BR \-a " " \fIAUTO_PORT\fR
+Port with auto-detection of HTTP/HTTPS based on first bytes received.
+Useful for non-standard port configurations.
+.TP
+.BR \-A " " \fIADMIN_PORT\fR
+Administrative HTTPS-only port. When specified, \fI/servstats\fR,
+\fI/servstats.txt\fR, and \fI/log=LEVEL\fR are only accessible on this port.
+Default: none (admin URIs available on all ports).
+.TP
+.BR \-n " " \fIIFACE\fR
+Bind to a specific network interface. Default: all interfaces.
+
+.SS Master/Worker Mode
+For high-availability setups with HAProxy or load balancers:
+.TP
+.BR \-M
+Run as index master. The master owns the certificate index and coordinates
+certificate generation across workers. Only one master per deployment.
+.TP
+.BR \-m " " \fISOCKET_PATH\fR
+Run as worker, connecting to an index master via Unix socket.
+Example: \fB\-m /var/run/pixelserv-index.sock\fR
+
+.SS TLS/Certificate Options
+.TP
+.BR \-z " " \fICERT_PATH\fR
+Directory for CA certificate (\fIca.crt\fR), private key (\fIca.key\fR),
+and generated server certificates. The user specified with \fB\-u\fR must
+have read/write permissions.
+Default: /var/cache/pixelserv (Entware: /opt/var/cache/pixelserv).
+.TP
+.BR \-c " " \fICACHE_SIZE\fR
+Maximum number of certificates to cache in memory. Higher values use more RAM.
+Default: 100.
+
+.SS Content Options
+.TP
+.BR \-H " " \fIHTML_FILE\fR
+External HTML file to serve as default response content.
+Maximum file size: 1MB. If not specified, built-in minimal responses are used.
+.TP
+.BR \-2
+Disable HTTP 204 response for \fI/generate_204\fR requests.
+Chrome uses these requests to detect captive portals. Disabling may cause
+Chrome to show network connectivity warnings.
+.TP
+.BR \-R
+Enable redirection to encoded path in tracker URLs.
+
+.SS Server Options
+.TP
+.BR \-T " " \fIMAX_THREADS\fR
+Maximum number of concurrent threads/connections.
+Default: 1200 (sufficient for most SOHO environments).
+.TP
+.BR \-O " " \fIKEEPALIVE_SEC\fR
+HTTP/1.1 keep-alive timeout in seconds. Connections are closed after
+this period of inactivity. Default: 5.
+.TP
+.BR \-s " " \fISTATS_URL\fR
+URL path for HTML statistics page. Default: /servstats.
+.TP
+.BR \-t " " \fISTATS_TXT_URL\fR
+URL path for plain text statistics. Default: /servstats.txt.
+.TP
+.BR \-u " " \fIUSER\fR
+User account to run as after binding to privileged ports.
+Default: nobody.
+.TP
+.BR \-f
+Stay in foreground. Do not daemonize. Useful for debugging or systemd.
+
+.SS Logging & Debug
+.TP
+.BR \-l " " \fILEVEL\fR
+Set log level (output to syslog):
+.RS
+.IP 0 4
+Critical errors only
+.IP 1 4
+Errors (default)
+.IP 2 4
+Warnings
+.IP 3 4
+Notices
+.IP 4 4
+Info (includes request URLs)
+.IP 5 4
+Debug (verbose)
+.RE
+.TP
+.BR \-B " " [\fICERT_FILE\fR]
+Run crypto and disk benchmark, then exit. If \fICERT_FILE\fR is provided,
+it is used instead of generating a new certificate. Useful for comparing
+performance across systems.
+
+.SH SUPPORTED URI/API
+.SS /ca.crt
+Download the CA certificate for installation on client devices.
+Mobile devices will prompt for certificate installation.
+.SS /favicon.ico
+pixelserv-tls favicon (small shield icon).
+.SS /servstats
+Server statistics in HTML format. Shows connection counts, TLS versions,
+certificate cache stats, and more.
+.SS /servstats.txt
+Server statistics in plain text format for scripting/monitoring.
+.SS /log=LEVEL
+Change log level at runtime without restart.
+LEVEL is 0-5 as described in \fB\-l\fR option.
+
+.SH SERVSTATS COUNTERS
+
+.SS Service Threads
+.TP
+.BR kcc
+Currently active connections/threads.
+.TP
+.BR kmx
+Maximum concurrent connections ever reached.
+.TP
+.BR kvg
+Average requests per connection (exponential moving average).
+.TP
+.BR krq
+Maximum requests ever handled by a single connection.
+
+.SS TLS Handshake
+.TP
+.BR slh
+Successful HTTPS requests processed.
+.TP
+.BR slm
+Certificate not found on disk (will be generated).
+.TP
+.BR sle
+Certificate load errors (disk corruption or damaged certs).
+.TP
+.BR slu
+Other TLS handshake failures.
+
+.SS TLS Error Details
+.TP
+.BR uca
+Client rejected CA certificate (CA not imported or app ignores user CAs).
+.TP
+.BR ucb
+Client reported "bad certificate" (certificate pinning detected).
+.TP
+.BR uce
+Client rejected server certificate (possible certificate pinning).
+.TP
+.BR ush
+Client abruptly closed connection during handshake.
+
+.SS TLS Versions
+.TP
+.BR v13 ", " v12 ", " v10
+Request counts by TLS version (1.3, 1.2, 1.0).
+.TP
+.BR zrt
+TLS 1.3 early data (0-RTT) requests.
+
+.SS Feature Flags (shown next to version)
+.TP
+.BR tfo
+TCP Fast Open support (Linux >= 3.7).
+.TP
+.BR tls1_3
+TLS 1.3 support (OpenSSL >= 1.1.1).
+.TP
+.BR drop_root
+Privilege dropping enabled.
+.TP
+.BR if_mode
+Interface binding mode enabled.
+
+.SH EXAMPLES
+.SS Basic Usage
+.nf
+# Listen on specific IP, default ports
+pixelserv-tls 192.168.1.1
+
+# Stay in foreground with custom ports
+pixelserv-tls 192.168.1.1 -p 80 -k 443 -f
+
+# High logging for debugging
+pixelserv-tls -f -l 5
+.fi
+
+.SS Master/Worker Setup (HAProxy)
+.nf
+# Start index master
+pixelserv-tls -M -z /var/cache/pixelserv -f
+
+# Start workers (on same or different machines)
+pixelserv-tls -m /var/run/pixelserv-index.sock -p 8080 -k 8443 -f
+.fi
+
+.SS Custom Certificate Path
+.nf
+pixelserv-tls -z /opt/certs -u www-data
+.fi
+
+.SH FILES
+.TP
+.I /var/cache/pixelserv/ca.crt
+CA certificate (must be imported to clients).
+.TP
+.I /var/cache/pixelserv/ca.key
+CA private key (keep secure!).
+.TP
+.I /var/cache/pixelserv/*.crt
+Generated server certificates.
+
+.SH AUTHOR
+Current maintainer: Torsten Jahnke
+.br
+Repository: https://github.com/TorstenJahnke/pixelserv-cors3
+
+.SH HISTORY
+pixelserv first appeared around 2003 as a minimal Perl script serving a 1x1 GIF.
+
+.IP 2009-2013 12
+mstombs rewrote it in C for performance.
+.IP 2013-2015 12
+HunterZ completed HTTP functionality.
+.IP 2015-2019 12
+kvic (kazoo.ga) added HTTPS/SNI, multi-threading, auto certificate generation,
+TLS session resumption, and renamed it to pixelserv-tls.
+.IP 2019-2025 12
+Torsten Jahnke continued development with lock-free certificate management,
+master/worker architecture, anti-adblock bypass, and extensive optimization.
+
+.SH COPYRIGHT
+Copyright \(co 2015-2025 Torsten Jahnke
+.br
+Copyright \(co 2015-2019 kvic (kazoo.ga)
+.br
+Copyright \(co 2013-2015 HunterZ
+.br
+Copyright \(co 2009-2013 mstombs
+.PP
+License: GPL v3 (https://www.gnu.org/licenses/gpl-3.0.html)
+.PP
+This is free software; see the source for copying conditions.
+There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+.SH BUGS
+Report bugs at: https://github.com/TorstenJahnke/pixelserv-cors3/issues
+
+.SH SEE ALSO
+.BR openssl (1),
+.BR haproxy (1),
+.BR systemctl (1)

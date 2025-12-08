@@ -1,0 +1,25 @@
+[Unit]
+Description=Pixelserv-TLS Worker
+Documentation=https://github.com/nicholasjamieson/pixelserv-tls
+After=network.target pixelserv-index.service
+Requires=pixelserv-index.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/pixelserv/worker.conf
+ExecStart=/usr/local/bin/pixelserv-tls ${IP} ${PORTS} -m /usr/local/pixelserver/pixelserv-index.sock -u nobody -z /usr/local/pixelserver -l 3
+Restart=always
+RestartSec=5
+
+# Security hardening
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/usr/local/pixelserver
+PrivateTmp=yes
+
+# Capabilities for binding to privileged ports
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID
+
+[Install]
+WantedBy=multi-user.target
